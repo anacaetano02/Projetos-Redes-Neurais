@@ -4,7 +4,7 @@
   "metadata": {
     "colab": {
       "provenance": [],
-      "authorship_tag": "ABX9TyNT2DJzJnwUdE+G54MVj/us",
+      "authorship_tag": "ABX9TyNLiJSQcMKhnTbnDb7szIwG",
       "include_colab_link": true
     },
     "kernelspec": {
@@ -28,21 +28,13 @@
     },
     {
       "cell_type": "code",
-      "execution_count": 5,
-      "metadata": {
-        "id": "RXAyLZWSyKKQ"
-      },
-      "outputs": [],
       "source": [
         "import os\n",
-        "os.makedirs('src', exist_ok=True)"
-      ]
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "%%writefile src/model.py\n",
+        "os.makedirs('src', exist_ok=True)\n",
         "\n",
+        "# Cria model.py\n",
+        "with open('src/model.py', 'w') as f:\n",
+        "    f.write('''\n",
         "\"\"\"\n",
         "model.py — Definições das arquiteturas MLP para classificação e regressão.\n",
         "Dataset: Lending Club (Kaggle)\n",
@@ -342,31 +334,13 @@
         "                  f\"{dados.std().item():>10.4f} \"\n",
         "                  f\"{dados.min().item():>10.4f} \"\n",
         "                  f\"{dados.max().item():>10.4f}\")\n",
-        "    print(f\"{'='*60}\\n\")\n"
-      ],
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "id": "HTqiAUuGyYsU",
-        "outputId": "dc9aaead-a635-49ce-be83-296461fb32b4"
-      },
-      "execution_count": 6,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "Overwriting src/model.py\n"
-          ]
-        }
-      ]
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "%%writefile src/training.py\n",
+        "    print(f\"{'='*60}\\n\")\n",
         "\n",
+        "''')\n",
+        "\n",
+        "# Cria training.py\n",
+        "with open('src/training.py', 'w') as f:\n",
+        "    f.write('''\n",
         "\"\"\"\n",
         "training.py — Training loop, validação por época, checkpointing e LR scheduling.\n",
         "Dataset: Lending Club (Kaggle)\n",
@@ -828,31 +802,13 @@
         "        lista_preds.append(preds.cpu())\n",
         "        lista_targets.append(y_batch.cpu())\n",
         "\n",
-        "    return torch.cat(lista_preds), torch.cat(lista_targets)\n"
-      ],
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "id": "9AJah7g_yxZS",
-        "outputId": "5d2e6260-786d-4467-8157-c8c5552ad822"
-      },
-      "execution_count": 7,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "Overwriting src/training.py\n"
-          ]
-        }
-      ]
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "%%writefile src/utils.py\n",
+        "    return torch.cat(lista_preds), torch.cat(lista_targets)\n",
         "\n",
+        "''')\n",
+        "\n",
+        "# Cria utils.py\n",
+        "with open('src/utils.py', 'w') as f:\n",
+        "    f.write('''\n",
         "\"\"\"\n",
         "utils.py — Métricas, visualizações e helpers para o Pipeline MLP.\n",
         "Dataset: Lending Club (Kaggle)\n",
@@ -1364,29 +1320,12 @@
         "    print(f\"{'='*45}\")\n",
         "    for k, v in config.items():\n",
         "        print(f\"  {k:<25}: {v}\")\n",
-        "    print(f\"{'='*45}\\n\")\n"
+        "    print(f\"{'='*45}\\n\")\n",
+        "\n",
+        "''')\n",
+        "\n",
+        "print(\"Pasta src/ criada com sucesso!\")\n"
       ],
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "id": "QEa70A8py2aD",
-        "outputId": "7fcd1b43-03fa-44c5-c8cf-3cc6ca83a63e"
-      },
-      "execution_count": 4,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "Writing src/utils.py\n"
-          ]
-        }
-      ]
-    },
-    {
-      "cell_type": "code",
-      "source": [],
       "metadata": {
         "id": "xMV7c0Owy85n"
       },
