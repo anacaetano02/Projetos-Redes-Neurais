@@ -87,3 +87,14 @@ class EarlyStopping:
         # Descompacta o modelo caso esteja envelopado em DataParallel
         model_to_save = model.module if isinstance(model, nn.DataParallel) else model
         torch.save(model_to_save.state_dict(), self.checkpoint_path)
+
+
+    def save_json(obj, path: str) -> None:
+        """Salva um objeto JSON (dicionário/lista) em disco, criando diretórios quando necessário."""
+        import json
+        parent = os.path.dirname(path)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+
