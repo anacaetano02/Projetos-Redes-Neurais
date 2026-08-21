@@ -145,7 +145,7 @@ def evaluate_on_test_set(
     dataloader: DataLoader, 
     device: torch.device, 
     mode: TaskMode = "classification"
-) -> None:
+) -> Dict[str, Any]:
     """
     Avaliação cega final no conjunto de teste.
     Imprime Matriz de Confusão, Classification Report e métricas de regressão.
@@ -174,25 +174,39 @@ def evaluate_on_test_set(
     print(f"\n========================================================")
     print(f"   RELATÓRIO DE DESEMPENHO NO CONJUNTO DE TESTE ({mode.upper()})")
     print(f"========================================================")
-    
+    metrics: Dict[str, Any] = {"mode": mode}
     if mode == "classification":
+        cm = confusion_matrix(all_targets, all_predictions)
         print("\nMatriz de Confusão:")
-        print(confusion_matrix(all_targets, all_predictions))
-        
+        print(cm)
         print("\nRelatório de Métricas:")
         print(classification_report(
             all_targets, 
             all_predictions, 
             target_names=["Fully Paid (0)", "Charged Off (1)"]
         ))
+        # Summary metrics
+        metrics.update({
+            "confusion_matrix": cm.tolist(),
+            "accuracy": float((all_predictions == all_targets).mean()),
+            "precision": float(precision_score(all_targets, all_predictions, zero_division=0)),
+            "recall": float(recall_score(all_targets, all_predictions, zero_division=0)),
+            "f1": float(f1_score(all_targets, all_predictions, zero_division=0)),
+        })
     elif mode == "regression":
         mae = mean_absolute_error(all_targets, all_predictions)
         mse = mean_squared_error(all_targets, all_predictions)
         rmse = np.sqrt(mse)
         r2 = r2_score(all_targets, all_predictions)
-        
         print(f"Mean Absolute Error (MAE):     {mae:.6f}")
         print(f"Mean Squared Error (MSE):      {mse:.6f}")
         print(f"Root Mean Squared Error (RMSE): {rmse:.6f}")
         print(f"Coeficiente R² (Determinação):  {r2:.4f}")
+        metrics.update({
+            "mae": float(mae),
+            "mse": float(mse),
+            "rmse": float(rmse),
+            "r2": float(r2),
+        })
     print(f"========================================================\n")
+    return metrics
