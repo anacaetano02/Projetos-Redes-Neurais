@@ -43,7 +43,9 @@ def download_kaggle_dataset(
     except Exception as e:
         print(f"[DataPipeline] Não foi possível executar o download via CLI do Kaggle ({e}).")
 
-
+    raise FileNotFoundError(
+        f"Não foi possível localizar ou baixar o dataset '{dataset_handle}' em nenhum dos caminhos esperados."
+    )
 
 def pipeline_dados_lending_club_completo(
     csv_path: str, 
@@ -144,7 +146,7 @@ def pipeline_dados_lending_club_completo(
             "std": std_val if (std_val is not None and std_val != 0) else 1.0
         }
     
-    
+
     def aplicar_imputacao_e_escala(df_partition: pl.DataFrame, stats: Dict[str, Dict[str, Any]]) -> pl.DataFrame:
         # Executa imputação de mediana e Z-score em uma única passada de expressões paralelas
         expressions = [
@@ -162,4 +164,39 @@ def pipeline_dados_lending_club_completo(
     print(f"Linhas -> Treino: {df_train_scaled.height} | Val: {df_val_scaled.height} | Teste: {df_test_scaled.height}")
         
     return df_train_scaled, df_val_scaled, df_test_scaled
-    
+
+
+
+def calcular_pesos_classe(
+    df_train: pl.DataFrame,
+    target_col: str = "classification_target",
+    num_classes: int = 2,
+) -> torch.Tensor:
+    """
+    Calcula pesos de classe inversamente proporcionais à frequência de cada classe
+    no conjunto de TREINO, para uso em nn.CrossEntropyLoss(weight=...).
+ 
+    Fórmula (balanceamento "inverse frequency"):
+        peso_da_classe = total_amostras / (num_classes * amostras_da_classe)
+ 
+    Isso faz com que erros na classe minoritária ("Charged Off") pesem mais na loss,
+    corrigindo a tendência do modelo de simplesmente prever sempre a classe majoritária.
+ 
+    IMPORTANTE: calcule sempre a partir de `df_train` (nunca de val/teste), para não
+    vazar informação sobre a distribuição de val/teste no treino.
+    """
+    total = df_train.height
+    weights = []
+    counts_log: Dict[int, int] = {}
+ 
+    for class_id in range(num_classes):
+        n_class = df_train.filter(pl.col(target_col) == class_id).height
+        n_class_safe = max(n_class, 1)  # evita divisão por zero se a classe não aparecer no treino
+        weight = total / (num_classes * n_class_safe)
+        weights.append(weight)
+        counts_log[class_id] = n_class
+ 
+    print(f"[DataPipeline] Contagem por classe (treino): {counts_log}")
+    print(f"[DataPipeline] Pesos de classe calculados: {dict(enumerate(weights))}")
+ 
+    return torch.tensor(weights, dtype=torch.float32)
