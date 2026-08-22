@@ -15,6 +15,7 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
     precision_score,
+    precision_recall_curve,
     r2_score,
     recall_score,
 )
@@ -157,23 +158,21 @@ def validate_one_epoch(
     )
 
 
-def evaluate_on_test_set(
+def _predict_probs_and_targets(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
     mode: TaskMode = "classification",
-) -> Dict[str, Any]:
+) -> "tuple[np.ndarray, np.ndarray]":
     """
-    Avaliação cega final no conjunto de teste.
-
-    Acumula predições e alvos na GPU e sincroniza com a CPU uma única vez, no final,
-    para evitar overhead de sincronizações repetidas por batch.
-    Imprime Matriz de Confusão, Classification Report e métricas de regressão,
-    e retorna um dicionário com as métricas para uso posterior (logs, JSON, etc.).
+    Roda o modelo em modo avaliação e retorna:
+      - classificação: a probabilidade da classe positiva (1 = Charged Off), via softmax.
+      - regressão: a predição contínua diretamente.
+    Sincroniza GPU->CPU apenas uma vez, no final.
     """
     model.eval()
     all_targets_list: List[torch.Tensor] = []
-    all_preds_list: List[torch.Tensor] = []
+    all_outputs_list: List[torch.Tensor] = []
 
     with torch.no_grad():
         for inputs, targets in dataloader:
@@ -181,22 +180,112 @@ def evaluate_on_test_set(
             outputs = model(inputs)
 
             if mode == "classification":
-                preds = outputs.argmax(dim=1)
-                all_preds_list.append(preds)
-            elif mode == "regression":
-                outputs = outputs.squeeze(-1)
-                all_preds_list.append(outputs)
+                probs_classe_positiva = torch.softmax(outputs, dim=1)[:, 1]
+                all_outputs_list.append(probs_classe_positiva)
+            else:
+                all_outputs_list.append(outputs.squeeze(-1))
 
             all_targets_list.append(targets)
 
-    all_predictions = torch.cat(all_preds_list).cpu().numpy()
+    all_outputs = torch.cat(all_outputs_list).cpu().numpy()
     all_targets = torch.cat(all_targets_list).cpu().numpy()
+    return all_outputs, all_targets
+
+
+def buscar_melhor_threshold(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    estrategia: Literal["f1", "recall_minimo"] = "f1",
+    recall_minimo: float = 0.5,
+) -> Dict[str, float]:
+    """
+    Varre a curva precisão-recall para encontrar o melhor threshold de decisão.
+
+    IMPORTANTE: `dataloader` deve ser o de VALIDAÇÃO, nunca o de teste — escolher o
+    threshold olhando o teste é uma forma de vazamento (overfitting na escolha do
+    ponto de operação), mesmo que o modelo em si não seja retreinado.
+
+    Args:
+        estrategia: "f1" maximiza o F1-score da classe positiva (Charged Off).
+                    "recall_minimo" maximiza a precisão entre os thresholds que
+                    atingem pelo menos `recall_minimo` de recall.
+        recall_minimo: usado apenas quando estrategia="recall_minimo".
+
+    Returns:
+        Dict com "threshold", "precision" e "recall" no ponto escolhido.
+    """
+    probs, targets = _predict_probs_and_targets(model, dataloader, device, mode="classification")
+    precisions, recalls, thresholds = precision_recall_curve(targets, probs)
+
+    # precision_recall_curve retorna 1 ponto a mais que thresholds (o último ponto
+    # é recall=0/precision=1, sem threshold correspondente) — descartamos esse último.
+    precisions_t = precisions[:-1]
+    recalls_t = recalls[:-1]
+
+    if len(thresholds) == 0:
+        # Caso degenerado (praticamente nunca ocorre com dados reais)
+        return {"threshold": 0.5, "precision": float(precisions_t[0]) if len(precisions_t) else 0.0,
+                "recall": float(recalls_t[0]) if len(recalls_t) else 0.0}
+
+    if estrategia == "recall_minimo":
+        candidatos = np.where(recalls_t >= recall_minimo)[0]
+        if len(candidatos) == 0:
+            idx = int(np.argmax(recalls_t))  # nenhum threshold atinge o mínimo pedido
+        else:
+            idx = candidatos[np.argmax(precisions_t[candidatos])]
+    else:  # "f1"
+        denom = precisions_t + recalls_t
+        f1s = np.where(denom > 0, 2 * precisions_t * recalls_t / np.maximum(denom, 1e-12), 0.0)
+        idx = int(np.argmax(f1s))
+
+    return {
+        "threshold": float(thresholds[idx]),
+        "precision": float(precisions_t[idx]),
+        "recall": float(recalls_t[idx]),
+    }
+
+
+def evaluate_on_test_set(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    mode: TaskMode = "classification",
+    threshold: Optional[float] = None,
+    dataset_label: str = "TESTE",
+) -> Dict[str, Any]:
+    """
+    Avaliação cega no conjunto informado (por padrão rotulado como "TESTE" no print,
+    mas pode ser reutilizada em VALIDAÇÃO passando dataset_label="VALIDAÇÃO",
+    por exemplo durante grid search).
+
+    Args:
+        threshold: em classificação, ponto de corte sobre a probabilidade da classe
+            positiva (1 = Charged Off). Se None, usa 0.5 (equivalente a argmax puro).
+            Encontre esse valor via `buscar_melhor_threshold` no conjunto de VALIDAÇÃO,
+            nunca no de teste.
+
+    Acumula predições e alvos na GPU e sincroniza com a CPU uma única vez, no final.
+    Imprime Matriz de Confusão, Classification Report e métricas de regressão,
+    e retorna um dicionário com as métricas para uso posterior (logs, JSON, etc.).
+    """
+    if mode == "classification":
+        probs, all_targets = _predict_probs_and_targets(model, dataloader, device, mode="classification")
+        cutoff = threshold if threshold is not None else 0.5
+        all_predictions = (probs >= cutoff).astype(np.int64)
+    else:
+        all_predictions, all_targets = _predict_probs_and_targets(model, dataloader, device, mode="regression")
+        cutoff = None
 
     print("\n========================================================")
-    print(f"   RELATÓRIO DE DESEMPENHO NO CONJUNTO DE TESTE ({mode.upper()})")
+    print(f"   RELATÓRIO DE DESEMPENHO NO CONJUNTO DE {dataset_label} ({mode.upper()})")
+    if mode == "classification":
+        print(f"   Threshold de decisão: {cutoff:.4f}")
     print("========================================================")
 
     metrics: Dict[str, Any] = {"mode": mode}
+    if mode == "classification":
+        metrics["threshold"] = float(cutoff)
 
     if mode == "classification":
         cm = confusion_matrix(all_targets, all_predictions)
@@ -208,6 +297,7 @@ def evaluate_on_test_set(
                 all_targets,
                 all_predictions,
                 target_names=["Fully Paid (0)", "Charged Off (1)"],
+                zero_division=0,
             )
         )
         metrics.update(
