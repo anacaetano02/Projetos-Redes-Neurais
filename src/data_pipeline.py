@@ -2,7 +2,7 @@ import os
 from typing import Tuple, Dict, Any
 import polars as pl
 import subprocess
-
+import torch
 
 def download_kaggle_dataset(
     dataset_handle: str = "wordsforthewise/lending-club",
