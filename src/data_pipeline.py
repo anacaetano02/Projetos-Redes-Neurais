@@ -112,7 +112,7 @@ def pipeline_dados_lending_club_completo(
         .select(selected_cols)
         .filter(pl.col("loan_status").is_in(["Fully Paid", "Charged Off"]))
         .with_columns([
-            pl.col(col).fill_null("unknown").cast(pl.Utf8) for col in CATEGORICAL_FEATURES
+            pl.col(col).fill_null("unknown").cast(pl.Utf8) for col in cat_features
         ])
         .with_columns(
             pl.when(pl.col("loan_status") == "Fully Paid").then(0).otherwise(1).alias("classification_target")
