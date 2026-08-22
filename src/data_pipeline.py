@@ -1,6 +1,7 @@
 import os
 from typing import Tuple, Dict, Any
 import polars as pl
+import subprocess
 
 
 def download_kaggle_dataset(
@@ -120,7 +121,7 @@ def pipeline_dados_lending_club_completo(
     )
     
     # 2. One-Hot Encoding (OHE) no DataFrame
-    df_encoded = df.to_dummies(columns=cat_features)
+    df_encoded = lazy_df.to_dummies(columns=cat_features)
     
     # 3. Divisão Física Estrita (70% Treino / 15% Validação / 15% Teste)
     df_shuffled = df_encoded.sample(fraction=1.0, seed=seed)
