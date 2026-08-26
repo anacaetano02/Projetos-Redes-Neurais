@@ -1,0 +1,17 @@
+# Dependências do Projeto 1 (MLP) — Polars + PyTorch
+# Cobre src/ (data.py, models.py, training.py, utils.py) e orquestrador_treino.ipynb.
+
+# Manipulação de dados
+polars>=1.0.0
+
+# Aprendizado de máquina e deep learning
+torch>=2.0.0
+scikit-learn>=1.3.0
+numpy>=1.24.0
+
+# Monitoramento e visualização
+tensorboard>=2.14.0
+matplotlib>=3.7.0
+
+# Aquisição do dataset (Kaggle — usado no orquestrador_treino.ipynb)
+kaggle>=1.5.0
