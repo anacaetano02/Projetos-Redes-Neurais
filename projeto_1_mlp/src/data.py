@@ -123,7 +123,11 @@ def codificar_categoricas(df: pl.DataFrame) -> pl.DataFrame:
 
 def split_temporal(df: pl.DataFrame, frac_treino: float = 0.70, frac_val: float = 0.15) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """Realiza o particionamento temporal cronológico baseado em issue_d para simular produção."""
-    df_sorted = df.sort("issue_d")
+    # issue_d continua como string "%b-%Y" (ex.: "Dec-2015") nesta etapa —
+    # ordenar pela coluna crua seria alfabético por nome de mês (ex.:
+    # "Aug-2018" antes de "Dec-2007"), não cronológico. Ordena pela data
+    # parseada; issue_d em si não é alterado.
+    df_sorted = df.sort(pl.col("issue_d").str.to_date("%b-%Y"))
     total_linhas = len(df_sorted)
     
     end_train = int(frac_treino * total_linhas)
