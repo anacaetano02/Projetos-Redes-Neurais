@@ -191,7 +191,20 @@ def preparar_dataloaders(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_test:
     """Instancia e expõe os DataLoader de treino, validação e teste de forma síncrona."""
     features = colunas_features_modelo(df_treino)
     input_size = len(features)
-    
+
+    # Confere que treino/val/teste terminaram com o mesmo número de
+    # colunas de feature — se codificar_categoricas rodasse depois do
+    # split (ordem errada), categorias ausentes em um split gerariam
+    # menos colunas dummy ali, e esse desalinhamento só apareceria como
+    # erro de shape confuso dentro do treino do modelo.
+    n_val = len(colunas_features_modelo(df_val))
+    n_test = len(colunas_features_modelo(df_test))
+    assert input_size == n_val == n_test, (
+        f"Número de features difere entre partições: treino={input_size}, "
+        f"val={n_val}, teste={n_test}. Confirme que codificar_categoricas "
+        f"rodou antes de split_temporal."
+    )
+
     X_train, y_train_clf, y_train_reg = extrair_arrays(df_treino, features)
     X_val, y_val_clf, y_val_reg = extrair_arrays(df_val, features)
     X_test, y_test_clf, y_test_reg = extrair_arrays(df_test, features)
