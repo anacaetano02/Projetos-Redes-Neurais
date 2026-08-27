@@ -18,7 +18,11 @@ _CATEGORICAS = {
 
 def carregar_df_raw(path: str, limiar_nulos_pct: float = 50.0) -> pl.DataFrame:
     """Carrega o DataFrame de forma preguiçosa e remove colunas com alto índice de nulos."""
-    lf = pl.scan_csv(path, null_values=["", "NA", "NaN"])
+    # ignore_errors=True: o export do Lending Club tem linhas de
+    # rodapé/resumo (ex.: "Total amount funded in policy code...") que não
+    # batem com o schema das colunas de dado — sem isso, o parser quebra ao
+    # encontrar a primeira linha malformada em vez de só descartá-la.
+    lf = pl.scan_csv(path, null_values=["", "NA", "NaN"], ignore_errors=True)
     total_linhas = lf.select(pl.len()).collect().item()
     contagem_nulos = lf.select(pl.all().null_count()).collect()
 
@@ -26,6 +30,13 @@ def carregar_df_raw(path: str, limiar_nulos_pct: float = 50.0) -> pl.DataFrame:
         col for col in contagem_nulos.columns
         if (contagem_nulos[col][0] / total_linhas) * 100 < limiar_nulos_pct
     ]
+
+    log_nota(
+        "ignore_errors=True está ativo no scan_csv — linhas malformadas "
+        "(ex.: rodapés/resumos do export do Lending Club) são descartadas "
+        f"silenciosamente durante o parsing. Total de linhas efetivamente "
+        f"lidas: {total_linhas}."
+    )
 
     return lf.select(colunas_validas).collect()
 
