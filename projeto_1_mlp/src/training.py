@@ -10,7 +10,16 @@ import torch.nn as nn
 import numpy as np
 import polars as pl
 from torch.utils.tensorboard import SummaryWriter
-from src.utils import log_etapa, log_nota, plot_curvas_loss, plot_gradient_norm, avaliar_classificacao, avaliar_regressao
+from src.utils import (
+    log_etapa,
+    log_nota,
+    plot_curvas_loss,
+    plot_gradient_norm,
+    capturar_distribuicao_ativacoes,
+    avaliar_classificacao,
+    avaliar_regressao,
+)
+from src.models import MLP
 
 _experimentos = []
 
@@ -230,3 +239,191 @@ def exportar_experimentos(
         f.write("\n".join(linhas_md))
 
     print(f"Experimentos exportados: '{path_json}' e '{path_md}' ({len(_experimentos)} registros)")
+
+def treinar_variacao(
+    tipo_problema: str,
+    input_size: int,
+    dados: dict,
+    device: str,
+    nome: str,
+    camadas_ocultas: list[int],
+    ativacao: type[nn.Module] = nn.ReLU,
+    dropout: float = 0.2,
+    usar_batchnorm: bool = True,
+    inicializacao: str | None = "he",
+    lr: float = 1e-3,
+    weight_decay: float = 1e-2,
+    pos_weight=None,
+    epocas: int = 30,
+    paciencia_early_stopping: int = 5,
+    scheduler_patience: int = 2,
+    checkpoint_dir: str = "outputs/checkpoints",
+    dir_runs: str = "runs",
+    dir_figuras: str = "outputs/report_assets",
+) -> dict:
+    """
+    Treina UMA configuração e a compara pela loss de VALIDAÇÃO — nunca
+    avalia no conjunto de teste. Registra em registrar_experimento com
+    tipo="busca_<tipo_problema>" (não "classificacao"/"regressao" puro),
+    para não misturar essas medições de busca com a avaliação final
+    (ver avaliar_modelo_final), que sozinha entra na comparação com o
+    baseline.
+
+    scheduler_patience deve ser MENOR que paciencia_early_stopping, com
+    folga suficiente para o novo LR ter algumas épocas de efeito antes do
+    treino parar (ex.: scheduler_patience=2, paciencia_early_stopping=5).
+    """
+    modelo = MLP(
+        input_size=input_size,
+        camadas_ocultas=camadas_ocultas,
+        ativacao=ativacao,
+        dropout=dropout,
+        usar_batchnorm=usar_batchnorm,
+        inicializacao=inicializacao,
+    ).to(device)
+
+    if tipo_problema == "classificacao":
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        loaders = dados["classificacao"]
+    elif tipo_problema == "regressao":
+        loss_fn = nn.MSELoss()
+        loaders = dados["regressao"]
+    else:
+        raise ValueError(f"tipo_problema deve ser 'classificacao' ou 'regressao', recebido: {tipo_problema}")
+
+    otimizador = torch.optim.AdamW(modelo.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(otimizador, mode="min", factor=0.5, patience=scheduler_patience)
+
+    checkpoint_path = os.path.join(checkpoint_dir, f"{nome}.pt")
+    historico = treinar_modelo(
+        modelo=modelo,
+        loader_treino=loaders["train"],
+        loader_val=loaders["val"],
+        loss_fn=loss_fn,
+        otimizador=otimizador,
+        epocas=epocas,
+        device=device,
+        checkpoint_path=checkpoint_path,
+        scheduler=scheduler,
+        nome_run=nome,
+        paciencia_early_stopping=paciencia_early_stopping,
+        dir_runs=dir_runs,
+    )
+    modelo = carregar_melhor_modelo(modelo, checkpoint_path, device)
+
+    plot_curvas_loss(historico, nome, salvar_dir=dir_figuras)
+    plot_gradient_norm(historico, nome, salvar_dir=dir_figuras)
+    capturar_distribuicao_ativacoes(modelo, loaders["val"], device, nome, salvar_dir=dir_figuras)
+
+    melhor_val_loss = min(historico["val_loss"])
+    registrar_experimento(
+        nome=nome,
+        tipo=f"busca_{tipo_problema}",
+        hiperparametros={
+            "camadas_ocultas": camadas_ocultas,
+            "ativacao": ativacao.__name__,
+            "dropout": dropout,
+            "usar_batchnorm": usar_batchnorm,
+            "inicializacao": inicializacao,
+            "lr": lr,
+            "weight_decay": weight_decay,
+        },
+        metricas={"melhor_val_loss": melhor_val_loss, "val_loss_final": historico["val_loss"][-1]},
+        notas="Comparação por validação — teste ainda não avaliado.",
+    )
+
+    return {
+        "modelo": modelo,
+        "historico": historico,
+        "checkpoint_path": checkpoint_path,
+        "melhor_val_loss": melhor_val_loss,
+    }
+
+def buscar_melhor_configuracao(
+    tipo_problema: str,
+    input_size: int,
+    dados: dict,
+    device: str,
+    grade_configuracoes: list[dict],
+    pos_weight=None,
+    epocas: int = 30,
+    prefixo_nome: str = "busca",
+    checkpoint_dir: str = "outputs/checkpoints",
+    dir_runs: str = "runs",
+    dir_figuras: str = "outputs/report_assets",
+) -> dict:
+    """
+    Treina uma lista de configurações em sequência (treinar_variacao) e
+    retorna a de menor melhor_val_loss. Nenhuma chamada toca o conjunto
+    de teste — comparação inteira por validação, mesma disciplina de
+    treinar_variacao.
+
+    grade_configuracoes: lista de dicts com os kwargs aceitos por
+    treinar_variacao (camadas_ocultas, ativacao, dropout, usar_batchnorm,
+    inicializacao, lr...). Chave 'nome' é opcional; se ausente, gera
+    "{prefixo_nome}_{i}". checkpoint_dir/dir_runs/dir_figuras valem para
+    todas as configurações da grade (repassados a cada treinar_variacao).
+    """
+    resultados = []
+    for i, config_original in enumerate(grade_configuracoes):
+        config = dict(config_original)
+        nome = config.pop("nome", f"{prefixo_nome}_{i}")
+
+        log_nota(f"Busca [{i + 1}/{len(grade_configuracoes)}]: '{nome}' - {config}")
+        resultado = treinar_variacao(
+            tipo_problema=tipo_problema,
+            input_size=input_size,
+            dados=dados,
+            device=device,
+            nome=nome,
+            pos_weight=pos_weight,
+            epocas=epocas,
+            checkpoint_dir=checkpoint_dir,
+            dir_runs=dir_runs,
+            dir_figuras=dir_figuras,
+            **config,
+        )
+        resultados.append({"nome": nome, "config": config, **resultado})
+
+    melhor = min(resultados, key=lambda r: r["melhor_val_loss"])
+    log_nota(
+        f"Busca concluída - {len(grade_configuracoes)} configurações testadas. "
+        f"Vencedora: '{melhor['nome']}' (melhor_val_loss={melhor['melhor_val_loss']:.4f})."
+    )
+
+    return {"resultados": resultados, "melhor": melhor}
+
+def avaliar_modelo_final(
+    tipo_problema: str,
+    modelo,
+    dados: dict,
+    device: str,
+    nome: str,
+    hiperparametros: dict,
+    notas: str = "",
+    dir_figuras: str = "outputs/report_assets",
+) -> dict:
+    """
+    Chamar UMA VEZ, só na configuração vencedora (menor melhor_val_loss
+    entre as variações testadas com treinar_variacao/buscar_melhor_configuracao).
+    É aqui, e só aqui, que o conjunto de TESTE é avaliado — a escolha da
+    vencedora não foi influenciada pelo teste, preservando a validade da
+    comparação. Registra com tipo="<tipo_problema>" (sem prefixo
+    "busca_"), entrando na comparação final com o baseline.
+    """
+    if tipo_problema == "classificacao":
+        metricas = avaliar_classificacao(modelo, dados["classificacao"]["test"], device, nome, salvar_dir=dir_figuras)
+    elif tipo_problema == "regressao":
+        metricas = avaliar_regressao(modelo, dados["regressao"]["test"], device, nome)
+    else:
+        raise ValueError(f"tipo_problema deve ser 'classificacao' ou 'regressao', recebido: {tipo_problema}")
+
+    registrar_experimento(
+        nome=nome,
+        tipo=tipo_problema,
+        hiperparametros=hiperparametros,
+        metricas=metricas,
+        notas=notas or "Configuração vencedora, selecionada por loss de validação. Avaliação final no teste.",
+    )
+
+    return metricas
