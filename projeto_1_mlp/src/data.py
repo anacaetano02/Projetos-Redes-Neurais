@@ -1,232 +1,224 @@
 """
-Módulo src/training.py
-Orquestra o loop de treinamento PyTorch, Early Stopping, decaimento de peso adaptativo
-com AdamW, ReduceLROnPlateau, logs do TensorBoard e persistência de experimentos.
+Módulo src/data.py
+Consolida todo o carregamento Polars, Engenharia de Atributos, One-Hot Encoding,
+Particionamento Temporal, Padronização e conversão para DataLoader do PyTorch.
 """
 import os
-import random
-import torch
-import torch.nn as nn
-import numpy as np
 import polars as pl
-from torch.utils.tensorboard import SummaryWriter
-from src.utils import log_etapa, log_nota, plot_curvas_loss, plot_gradient_norm, avaliar_classificacao, avaliar_regressao
+import numpy as np
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+from src.utils import log_etapa, log_nota
 
-_experimentos = []
+_NAO_FEATURES = {"id", "issue_d", "target_classificacao", "target_regressao"}
+_CATEGORICAS = {
+    "home_ownership", "verification_status", "purpose", "addr_state",
+    "initial_list_status", "application_type", "disbursement_method",
+}
 
-def fixar_seeds(seed: int = 42) -> None:
-    """Garante o determinismo científico desativando o autotuning do cuDNN."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    print(f"Semente {seed} configurada de forma estável e determinística!")
+def carregar_df_raw(path: str, limiar_nulos_pct: float = 50.0) -> pl.DataFrame:
+    """Carrega o DataFrame de forma preguiçosa e remove colunas com alto índice de nulos."""
+    # ignore_errors=True: o export do Lending Club tem linhas de
+    # rodapé/resumo (ex.: "Total amount funded in policy code...") que não
+    # batem com o schema das colunas de dado — sem isso, o parser quebra ao
+    # encontrar a primeira linha malformada em vez de só descartá-la.
+    lf = pl.scan_csv(path, null_values=["", "NA", "NaN"], ignore_errors=True)
+    total_linhas = lf.select(pl.len()).collect().item()
+    contagem_nulos = lf.select(pl.all().null_count()).collect()
 
-def calcular_gradient_norm(modelo: nn.Module) -> float:
-    """Calcula a norma L2 acumulativa dos tensores ativos .grad."""
-    total_norm = 0.0
-    for p in modelo.parameters():
-        if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    return total_norm ** 0.5
+    colunas_validas = [
+        col for col in contagem_nulos.columns
+        if (contagem_nulos[col][0] / total_linhas) * 100 < limiar_nulos_pct
+    ]
 
-def treinar_epoca(modelo, loader, loss_fn, otimizador, device: str) -> tuple[float, float]:
-    modelo.train()
-    loss_total = 0.0
-    grad_norm_total = 0.0
-    n_batches = 0
+    log_nota(
+        "ignore_errors=True está ativo no scan_csv — linhas malformadas "
+        "(ex.: rodapés/resumos do export do Lending Club) são descartadas "
+        f"silenciosamente durante o parsing. Total de linhas efetivamente "
+        f"lidas: {total_linhas}."
+    )
+
+    return lf.select(colunas_validas).collect()
+
+def colunas_features_modelo(df: pl.DataFrame) -> list[str]:
+    """Lista todas as colunas de entrada pós-processamento e OHE."""
+    return [c for c in df.columns if c not in _NAO_FEATURES]
+
+def colunas_numericas_continuas(df: pl.DataFrame) -> list[str]:
+    """Filtra colunas contínuas para análise de skew e normalização."""
+    return [
+        c for c in df.columns 
+        if df[c].dtype in (pl.Float64, pl.Float32) and c not in _NAO_FEATURES
+    ]
+
+def tratar_earliest_cr_line(df: pl.DataFrame) -> pl.DataFrame:
+    """Calcula o tempo de histórico de crédito em anos de forma robusta."""
+    df = df.filter(pl.col("earliest_cr_line").is_not_null())
+    df = df.with_columns(
+        (((pl.col("issue_d").str.to_date("%b-%Y") - pl.col("earliest_cr_line").str.to_date("%b-%Y"))
+          .dt.total_days() / 365.25)
+         .clip(lower_bound=0.0))
+        .alias("anos_historico_credito")
+    )
+    return df.drop("earliest_cr_line")
+
+def agrupar_home_ownership(df: pl.DataFrame) -> pl.DataFrame:
+    """Consolida classes de propriedade de moradia raras em 'OTHER'."""
+    return df.with_columns(
+        pl.when(pl.col("home_ownership").is_in(["OTHER", "NONE", "ANY"]))
+        .then(pl.lit("OTHER"))
+        .otherwise(pl.col("home_ownership"))
+        .alias("home_ownership")
+    )
+
+def extrair_term_meses(df: pl.DataFrame) -> pl.DataFrame:
+    """Converte o prazo do empréstimo em string ('36 months'/'60 months') para numérico."""
+    return df.with_columns(
+        pl.col("term").str.extract(r"(\d+)").cast(pl.Int32).alias("term_meses")
+    ).drop("term")
+
+def mapear_emp_length(df: pl.DataFrame) -> pl.DataFrame:
+    """Mapeia tempo de emprego para escala ordinal, criando flag para nulos."""
+    emp_map = {
+        "< 1 year": 0, "1 year": 1, "2 years": 2, "3 years": 3, "4 years": 4,
+        "5 years": 5, "6 years": 6, "7 years": 7, "8 years": 8, "9 years": 9,
+        "10+ years": 10
+    }
+    return df.with_columns([
+        pl.col("emp_length").replace_strict(emp_map, default=None).cast(pl.Int32).alias("emp_length_num"),
+        pl.col("emp_length").is_null().cast(pl.Int8).alias("emp_length_missing")
+    ]).drop("emp_length")
+
+def tratar_dti(df: pl.DataFrame) -> pl.DataFrame:
+    """Unifica valores sentinelas de dti, aplica imputação e clipping."""
+    return df.with_columns([
+        pl.when(pl.col("dti").is_in([999, -1])).then(None).otherwise(pl.col("dti")).alias("dti"),
+        pl.col("dti").is_null().cast(pl.Int8).alias("dti_missing")
+    ])
+
+def tratar_annual_inc(df: pl.DataFrame) -> pl.DataFrame:
+    """Aplica transformação log1p e clipping inferior na renda anual para estabilizar skew."""
+    mediana = df["annual_inc"].median()
+    return df.with_columns(
+        pl.col("annual_inc").fill_null(mediana)
+    ).with_columns(
+        pl.col("annual_inc").clip(lower_bound=100.0).log1p().alias("annual_inc")
+    )
+
+def aplicar_transformacoes_por_regra(df: pl.DataFrame) -> pl.DataFrame:
+    """Tratamento sistemático de variáveis altamente assimétricas por regras matemáticas."""
+    # Para colunas com skew elevado, aplica o log1p para homogeneizar a escala
+    for col in df.columns:
+        if col in _CATEGORICAS or col in _NAO_FEATURES:
+            continue
+        if df[col].dtype in (pl.Float64, pl.Int64, pl.Int32):
+            if df[col].skew() >= 1.0:
+                df = df.with_columns(pl.col(col).log1p())
+    return df
+
+def codificar_categoricas(df: pl.DataFrame) -> pl.DataFrame:
+    """Executa One-Hot Encoding sínclito para evitar divergência de dimensões entre splits."""
+    categoricas_existentes = [c for c in df.columns if c in _CATEGORICAS]
+    return df.to_dummies(columns=categoricas_existentes)
+
+def split_temporal(df: pl.DataFrame, frac_treino: float = 0.70, frac_val: float = 0.15) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Realiza o particionamento temporal cronológico baseado em issue_d para simular produção."""
+    df_sorted = df.sort("issue_d")
+    total_linhas = len(df_sorted)
     
-    for X_batch, y_batch in loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+    end_train = int(frac_treino * total_linhas)
+    end_val = end_train + int(frac_val * total_linhas)
+    
+    df_train = df_sorted.slice(0, end_train)
+    df_val_set = df_sorted.slice(end_train, end_val - end_train)
+    df_test = df_sorted.slice(end_val)
+    
+    return df_train, df_val_set, df_test
+
+def tratar_nulos_residuais(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_test: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Imputa pela mediana de treino qualquer nulo que tenha sobrevivido."""
+    for col in df_treino.columns:
+        if col in _NAO_FEATURES:
+            continue
+        tem_nulo = (
+            df_treino[col].null_count() > 0
+            or df_val[col].null_count() > 0
+            or df_test[col].null_count() > 0
+        )
+        if tem_nulo:
+            mediana = df_treino[col].median()
+            df_treino = df_treino.with_columns(pl.col(col).fill_null(mediana))
+            df_val = df_val.with_columns(pl.col(col).fill_null(mediana))
+            df_test = df_test.with_columns(pl.col(col).fill_null(mediana))
+    return df_treino, df_val, df_test
+
+def padronizar_numericas(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_test: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, dict]:
+    """Aplica normalização Z-score com parâmetros estritamente extraídos do treino."""
+    stats = {}
+    colunas_cont = colunas_numericas_continuas(df_treino)
+    
+    for col in colunas_cont:
+        mean = df_treino[col].mean()
+        std = df_treino[col].std()
+        std = std if std != 0 else 1.0
+        stats[col] = {"mean": mean, "std": std}
         
-        otimizador.zero_grad()
-        out = modelo(X_batch).squeeze()
-        loss = loss_fn(out, y_batch)
-        loss.backward()
+        df_treino = df_treino.with_columns(((pl.col(col) - mean) / std).alias(col))
+        df_val = df_val.with_columns(((pl.col(col) - mean) / std).alias(col))
+        df_test = df_test.with_columns(((pl.col(col) - mean) / std).alias(col))
         
-        # Captura grad_norm na janela correta (pós-backward, pré-step)
-        gn = calcular_gradient_norm(modelo)
-        grad_norm_total += gn
-        
-        otimizador.step()
-        loss_total += loss.item()
-        n_batches += 1
-        
-    return loss_total / n_batches, grad_norm_total / n_batches
+    return df_treino, df_val, df_test, stats
 
-@torch.no_grad()
-def avaliar(modelo, loader, loss_fn, device: str) -> float:
-    modelo.eval()
-    loss_total = 0.0
-    n_batches = 0
-    for X_batch, y_batch in loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        out = modelo(X_batch).squeeze()
-        loss = loss_fn(out, y_batch)
-        loss_total += loss.item()
-        n_batches += 1
-    return loss_total / n_batches
+def extrair_arrays(df: pl.DataFrame, colunas_features: list[str]):
+    """Converte o DataFrame Polars para arrays NumPy em float32 para o PyTorch."""
+    X = df.select(colunas_features).to_numpy().astype("float32")
+    y_clf = df["target_classificacao"].to_numpy().astype("float32")
+    y_reg = df["target_regressao"].to_numpy().astype("float32")
+    return X, y_clf, y_reg
 
-def treinar_modelo(modelo, loader_treino, loader_val, loss_fn, otimizador, epocas: int, device: str = "cpu", checkpoint_path: str = "melhor_modelo.pt", scheduler=None, nome_run: str = "run", paciencia_early_stopping: int = 5, dir_runs: str = "runs") -> dict:
-    """Executa o loop principal aplicando Early Stopping e checkpointing via state_dict."""
-    diretorio_checkpoint = os.path.dirname(checkpoint_path)
-    if diretorio_checkpoint:
-        os.makedirs(diretorio_checkpoint, exist_ok=True)
+def validar_tensores(tensores: dict[str, torch.Tensor], input_size_esperado: int) -> None:
+    """Verifica integridade de dimensões, NaNs e valores infinitos."""
+    for nome, tensor in tensores.items():
+        assert tensor.shape[1] == input_size_esperado, f"{nome} possui tamanho de colunas incompatível."
+        assert not torch.isnan(tensor).any(), f"{nome} possui valores NaNs impeditivos."
+        assert not torch.isinf(tensor).any(), f"{nome} possui valores infinitos."
 
-    writer = SummaryWriter(os.path.join(dir_runs, nome_run))
-    best_val_loss = float("inf")
-    counter_es = 0
-
-    historico = {"train_loss": [], "val_loss": [], "grad_norm": [], "lr": []}
-
-    try:
-        for epoch in range(1, epocas + 1):
-            trn_loss, avg_gn = treinar_epoca(modelo, loader_treino, loss_fn, otimizador, device)
-            val_loss = avaliar(modelo, loader_val, loss_fn, device)
-
-            current_lr = otimizador.param_groups[0]["lr"]
-
-            historico["train_loss"].append(trn_loss)
-            historico["val_loss"].append(val_loss)
-            historico["grad_norm"].append(avg_gn)
-            historico["lr"].append(current_lr)
-
-            writer.add_scalar("Loss/Treino", trn_loss, epoch)
-            writer.add_scalar("Loss/Validação", val_loss, epoch)
-            writer.add_scalar("GradientNorm", avg_gn, epoch)
-            writer.add_scalar("LearningRate", current_lr, epoch)
-
-            print(f"Época {epoch:02d} | Train Loss: {trn_loss:.4f} | Val Loss: {val_loss:.4f} | GN: {avg_gn:.3f} | LR: {current_lr:.6f}")
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                counter_es = 0
-                # Salvando checkpoint físico estável
-                torch.save({
-                    "epoca": epoch,
-                    "state_dict": modelo.state_dict(),
-                    "val_loss": val_loss
-                }, checkpoint_path)
-            else:
-                counter_es += 1
-                if counter_es >= paciencia_early_stopping:
-                    print(f"Early Stopping disparado na época {epoch}!")
-                    break
-
-            if scheduler is not None:
-                # Sincronismo de paciências: scheduler enxerga o platô antes do Early Stopping
-                scheduler.step(val_loss)
-    finally:
-        writer.close()
-
-    return historico
-
-def carregar_melhor_modelo(modelo, checkpoint_path: str, device: str = "cpu"):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    modelo.load_state_dict(checkpoint["state_dict"])
-    modelo.to(device)
-    print(f"Modelo recarregado com sucesso! Época: {checkpoint['epoca']} | Val Loss: {checkpoint['val_loss']:.4f}")
-    return modelo
-
-def registrar_experimento(nome: str, tipo: str, hiperparametros: dict, metricas: dict, notas: str = ""):
-    """Registra o experimento na tabela global."""
-    _experimentos.append({
-        "data": str(np.datetime64("now")),
-        "nome": nome,
-        "tipo": tipo,
-        "hiperparametros": hiperparametros,
-        "metricas": metricas,
-        "notas": notas
-    })
-
-def _tabela_metricas(familia: str, apenas_busca: bool | None) -> pl.DataFrame:
-    registros = [r for r in _experimentos if familia in r["tipo"]]
-    if apenas_busca is True:
-        registros = [r for r in registros if r["tipo"].startswith("busca_")]
-    elif apenas_busca is False:
-        registros = [r for r in registros if not r["tipo"].startswith("busca_")]
-
-    linhas = []
-    for r in registros:
-        linha = {"nome": r["nome"], "tipo": r["tipo"]}
-        linha.update({f"metrica_{k}": v for k, v in r["metricas"].items()})
-        linha["notas"] = r["notas"]
-        linhas.append(linha)
-    return pl.DataFrame(linhas) if linhas else pl.DataFrame()
-
-def _tabela_hiperparametros(familia: str, apenas_busca: bool | None) -> pl.DataFrame:
-    registros = [r for r in _experimentos if familia in r["tipo"]]
-    if apenas_busca is True:
-        registros = [r for r in registros if r["tipo"].startswith("busca_")]
-    elif apenas_busca is False:
-        registros = [r for r in registros if not r["tipo"].startswith("busca_")]
-
-    linhas = []
-    for r in registros:
-        linha = {"nome": r["nome"], "tipo": r["tipo"]}
-        linha.update({f"hp_{k}": str(v) for k, v in r["hiperparametros"].items()})
-        linhas.append(linha)
-    return pl.DataFrame(linhas) if linhas else pl.DataFrame()
-
-def _tabela_para_markdown(df: pl.DataFrame) -> str:
-    """Converte um pl.DataFrame numa tabela markdown (GitHub-flavored)."""
-    if df.is_empty():
-        return "_(nenhum registro)_\n"
-
-    colunas = df.columns
-    linhas = ["| " + " | ".join(colunas) + " |", "|" + "|".join(["---"] * len(colunas)) + "|"]
-    for row in df.iter_rows(named=True):
-        valores = []
-        for c in colunas:
-            v = row[c]
-            if v is None:
-                valores.append("")
-            elif isinstance(v, float):
-                valores.append(f"{v:.4f}")
-            else:
-                valores.append(str(v))
-        linhas.append("| " + " | ".join(valores) + " |")
-    return "\n".join(linhas) + "\n"
-
-def exportar_experimentos(
-    path_json: str = "outputs/report_assets/experimentos.json",
-    path_md: str = "outputs/report_assets/log_experimentos.md",
-) -> None:
-    """Exporta o histórico: JSON (dado bruto) + markdown (tabela legível, pronta para o relatório)."""
-    import json
-    diretorio_json = os.path.dirname(path_json)
-    if diretorio_json:
-        os.makedirs(diretorio_json, exist_ok=True)
-    with open(path_json, "w", encoding="utf-8") as f:
-        json.dump(_experimentos, f, indent=2, ensure_ascii=False)
-
-    linhas_md = ["# Log de Experimentos\n"]
-    for familia, titulo in [("classificacao", "Classificação"), ("regressao", "Regressão")]:
-        linhas_md.append(f"## {titulo}\n")
-
-        linhas_md.append("### Resultados finais (teste)\n")
-        linhas_md.append("#### Métricas\n")
-        linhas_md.append(_tabela_para_markdown(_tabela_metricas(familia, apenas_busca=False)))
-        linhas_md.append("")
-        linhas_md.append("#### Hiperparâmetros\n")
-        linhas_md.append(_tabela_para_markdown(_tabela_hiperparametros(familia, apenas_busca=False)))
-        linhas_md.append("")
-
-        linhas_md.append("### Testes de busca de hiperparâmetros (validação)\n")
-        linhas_md.append("#### Métricas\n")
-        linhas_md.append(_tabela_para_markdown(_tabela_metricas(familia, apenas_busca=True)))
-        linhas_md.append("")
-        linhas_md.append("#### Hiperparâmetros\n")
-        linhas_md.append(_tabela_para_markdown(_tabela_hiperparametros(familia, apenas_busca=True)))
-        linhas_md.append("")
-
-    diretorio_md = os.path.dirname(path_md)
-    if diretorio_md:
-        os.makedirs(diretorio_md, exist_ok=True)
-    with open(path_md, "w", encoding="utf-8") as f:
-        f.write("\n".join(linhas_md))
-
-    print(f"Experimentos exportados: '{path_json}' e '{path_md}' ({len(_experimentos)} registros)")
+def preparar_dataloaders(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_test: pl.DataFrame, batch_size: int = 512) -> dict:
+    """Instancia e expõe os DataLoader de treino, validação e teste de forma síncrona."""
+    features = colunas_features_modelo(df_treino)
+    input_size = len(features)
+    
+    X_train, y_train_clf, y_train_reg = extrair_arrays(df_treino, features)
+    X_val, y_val_clf, y_val_reg = extrair_arrays(df_val, features)
+    X_test, y_test_clf, y_test_reg = extrair_arrays(df_test, features)
+    
+    # Validação cruzada de tensores
+    validar_tensores({
+        "X_train": torch.from_numpy(X_train),
+        "X_val": torch.from_numpy(X_val),
+        "X_test": torch.from_numpy(X_test)
+    }, input_size)
+    
+    # Datasets
+    ds_train_clf = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train_clf))
+    ds_train_reg = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train_reg))
+    
+    ds_val_clf = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val_clf))
+    ds_val_reg = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val_reg))
+    
+    ds_test_clf = TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test_clf))
+    ds_test_reg = TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test_reg))
+    
+    return {
+        "input_size": input_size,
+        "classificacao": {
+            "train": DataLoader(ds_train_clf, batch_size=batch_size, shuffle=True, drop_last=True),
+            "val": DataLoader(ds_val_clf, batch_size=batch_size, shuffle=False),
+            "test": DataLoader(ds_test_clf, batch_size=batch_size, shuffle=False),
+        },
+        "regressao": {
+            "train": DataLoader(ds_train_reg, batch_size=batch_size, shuffle=True, drop_last=True),
+            "val": DataLoader(ds_val_reg, batch_size=batch_size, shuffle=False),
+            "test": DataLoader(ds_test_reg, batch_size=batch_size, shuffle=False),
+        }
+    }
