@@ -37,16 +37,30 @@ def carregar_df_raw(path: str, limiar_nulos_pct: float = 50.0) -> pl.DataFrame:
     total_linhas = lf.select(pl.len()).collect().item()
     contagem_nulos = lf.select(pl.all().null_count()).collect()
 
-    colunas_validas = [
-        col for col in contagem_nulos.columns
-        if (contagem_nulos[col][0] / total_linhas) * 100 < limiar_nulos_pct
-    ]
-
     log_nota(
         "ignore_errors=True está ativo no scan_csv — linhas malformadas "
         "(ex.: rodapés/resumos do export do Lending Club) são descartadas "
         f"silenciosamente durante o parsing. Total de linhas efetivamente "
         f"lidas: {total_linhas}."
+    )
+
+    resumo_nulos = (
+        contagem_nulos
+        .unpivot(variable_name="coluna", value_name="nulos")
+        .with_columns((pl.col("nulos") / total_linhas * 100).round(2).alias("percentual"))
+        .filter(pl.col("nulos") > 0)
+        .sort("percentual", descending=True)
+    )
+    log_etapa("Perfil de nulos - todas as colunas com algum nulo", resumo_nulos)
+
+    colunas_validas = [
+        col for col in contagem_nulos.columns
+        if (contagem_nulos[col][0] / total_linhas) * 100 < limiar_nulos_pct
+    ]
+    colunas_removidas = resumo_nulos.filter(pl.col("percentual") >= limiar_nulos_pct)
+    log_etapa(
+        f"Colunas removidas por >={limiar_nulos_pct}% de nulos ({colunas_removidas.height} colunas)",
+        colunas_removidas,
     )
 
     return lf.select(colunas_validas).collect()
@@ -613,5 +627,62 @@ def preparar_dataloaders(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_test:
             "train": DataLoader(ds_train_reg, batch_size=batch_size, shuffle=True, drop_last=True),
             "val": DataLoader(ds_val_reg, batch_size=batch_size, shuffle=False),
             "test": DataLoader(ds_test_reg, batch_size=batch_size, shuffle=False),
+        },
+    }
+
+def construir_ambiente_reduzido(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_teste: pl.DataFrame, colunas_selecionadas: list[str], tipo_problema: str, batch_size: int = 512) -> dict:
+    """
+    Monta um dict "dados" no MESMO formato de preparar_dataloaders, mas
+    restrito a colunas_selecionadas e a um único tipo_problema — pronto
+    para passar direto a treinar_variacao/avaliar_modelo_final sem
+    modificar nenhuma dessas funções.
+
+    Usado depois de calcular_permutation_importance + selecionar_top_features
+    (ver utils.py), para medir se um subconjunto de features (ex.: top 30
+    de ~200) sustenta o desempenho do modelo completo — reaproveitando a
+    MESMA arquitetura e loop de treino, isolando o efeito da redução de
+    features de qualquer outra variável.
+
+    Só constrói os loaders do tipo_problema pedido (não classificação e
+    regressão juntas, como preparar_dataloaders) — a seleção de features
+    tipicamente parte da importância medida para um problema específico.
+    """
+    if tipo_problema not in ("classificacao", "regressao"):
+        raise ValueError(f"tipo_problema deve ser 'classificacao' ou 'regressao', recebido: {tipo_problema}")
+
+    input_size = len(colunas_selecionadas)
+
+    X_train, y_train_clf, y_train_reg = extrair_arrays(df_treino, colunas_selecionadas)
+    X_val, y_val_clf, y_val_reg = extrair_arrays(df_val, colunas_selecionadas)
+    X_test, y_test_clf, y_test_reg = extrair_arrays(df_teste, colunas_selecionadas)
+
+    validar_tensores({
+        "X_train": torch.from_numpy(X_train),
+        "X_val": torch.from_numpy(X_val),
+        "X_test": torch.from_numpy(X_test),
+    }, input_size)
+
+    X_train_t, X_val_t, X_test_t = torch.from_numpy(X_train), torch.from_numpy(X_val), torch.from_numpy(X_test)
+
+    def _y(arr):
+        return torch.from_numpy(arr).unsqueeze(1)
+
+    if tipo_problema == "classificacao":
+        y_train_t, y_val_t, y_test_t = _y(y_train_clf), _y(y_val_clf), _y(y_test_clf)
+    else:
+        y_train_t, y_val_t, y_test_t = _y(y_train_reg), _y(y_val_reg), _y(y_test_reg)
+
+    ds_train = TensorDataset(X_train_t, y_train_t)
+    ds_val = TensorDataset(X_val_t, y_val_t)
+    ds_test = TensorDataset(X_test_t, y_test_t)
+
+    log_nota(f"Ambiente reduzido pronto: {input_size} features selecionadas (tipo_problema={tipo_problema}).")
+
+    return {
+        "input_size": input_size,
+        tipo_problema: {
+            "train": DataLoader(ds_train, batch_size=batch_size, shuffle=True, drop_last=True),
+            "val": DataLoader(ds_val, batch_size=batch_size, shuffle=False),
+            "test": DataLoader(ds_test, batch_size=batch_size, shuffle=False),
         },
     }
