@@ -42,28 +42,35 @@ def calcular_gradient_norm(modelo: nn.Module) -> float:
             total_norm += param_norm.item() ** 2
     return total_norm ** 0.5
 
-def treinar_epoca(modelo, loader, loss_fn, otimizador, device: str) -> tuple[float, float]:
+def treinar_epoca(modelo, loader, loss_fn, otimizador, device: str, clip_grad_norm_max: float | None = 5.0) -> tuple[float, float]:
     modelo.train()
     loss_total = 0.0
     grad_norm_total = 0.0
     n_batches = 0
-    
+
     for X_batch, y_batch in loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        
+
         otimizador.zero_grad()
         out = modelo(X_batch).squeeze()
         loss = loss_fn(out, y_batch)
         loss.backward()
-        
-        # Captura grad_norm na janela correta (pós-backward, pré-step)
-        gn = calcular_gradient_norm(modelo)
+
+        # Captura grad_norm na janela correta (pós-backward, pré-step). Com
+        # clip_grad_norm_max definido, clip_grad_norm_ também limita a
+        # norma ANTES do step — não só mede o gradiente explosivo que
+        # plot_gradient_norm já alerta, evita de fato o passo de otimização
+        # correspondente.
+        if clip_grad_norm_max is not None:
+            gn = torch.nn.utils.clip_grad_norm_(modelo.parameters(), max_norm=clip_grad_norm_max).item()
+        else:
+            gn = calcular_gradient_norm(modelo)
         grad_norm_total += gn
-        
+
         otimizador.step()
         loss_total += loss.item()
         n_batches += 1
-        
+
     return loss_total / n_batches, grad_norm_total / n_batches
 
 @torch.no_grad()
@@ -79,7 +86,7 @@ def avaliar(modelo, loader, loss_fn, device: str) -> float:
         n_batches += 1
     return loss_total / n_batches
 
-def treinar_modelo(modelo, loader_treino, loader_val, loss_fn, otimizador, epocas: int, device: str = "cpu", checkpoint_path: str = "melhor_modelo.pt", scheduler=None, nome_run: str = "run", paciencia_early_stopping: int = 5, dir_runs: str = "runs") -> dict:
+def treinar_modelo(modelo, loader_treino, loader_val, loss_fn, otimizador, epocas: int, device: str = "cpu", checkpoint_path: str = "melhor_modelo.pt", scheduler=None, nome_run: str = "run", paciencia_early_stopping: int = 5, dir_runs: str = "runs", clip_grad_norm_max: float | None = 5.0) -> dict:
     """Executa o loop principal aplicando Early Stopping e checkpointing via state_dict."""
     diretorio_checkpoint = os.path.dirname(checkpoint_path)
     if diretorio_checkpoint:
@@ -93,7 +100,7 @@ def treinar_modelo(modelo, loader_treino, loader_val, loss_fn, otimizador, epoca
 
     try:
         for epoch in range(1, epocas + 1):
-            trn_loss, avg_gn = treinar_epoca(modelo, loader_treino, loss_fn, otimizador, device)
+            trn_loss, avg_gn = treinar_epoca(modelo, loader_treino, loss_fn, otimizador, device, clip_grad_norm_max=clip_grad_norm_max)
             val_loss = avaliar(modelo, loader_val, loss_fn, device)
 
             current_lr = otimizador.param_groups[0]["lr"]
@@ -260,6 +267,7 @@ def treinar_variacao(
     checkpoint_dir: str = "outputs/checkpoints",
     dir_runs: str = "runs",
     dir_figuras: str = "outputs/report_assets",
+    clip_grad_norm_max: float | None = 5.0,
 ) -> dict:
     """
     Treina UMA configuração e a compara pela loss de VALIDAÇÃO — nunca
@@ -308,6 +316,7 @@ def treinar_variacao(
         nome_run=nome,
         paciencia_early_stopping=paciencia_early_stopping,
         dir_runs=dir_runs,
+        clip_grad_norm_max=clip_grad_norm_max,
     )
     modelo = carregar_melhor_modelo(modelo, checkpoint_path, device)
 
@@ -351,6 +360,7 @@ def buscar_melhor_configuracao(
     checkpoint_dir: str = "outputs/checkpoints",
     dir_runs: str = "runs",
     dir_figuras: str = "outputs/report_assets",
+    clip_grad_norm_max: float | None = 5.0,
 ) -> dict:
     """
     Treina uma lista de configurações em sequência (treinar_variacao) e
@@ -361,8 +371,9 @@ def buscar_melhor_configuracao(
     grade_configuracoes: lista de dicts com os kwargs aceitos por
     treinar_variacao (camadas_ocultas, ativacao, dropout, usar_batchnorm,
     inicializacao, lr...). Chave 'nome' é opcional; se ausente, gera
-    "{prefixo_nome}_{i}". checkpoint_dir/dir_runs/dir_figuras valem para
-    todas as configurações da grade (repassados a cada treinar_variacao).
+    "{prefixo_nome}_{i}". checkpoint_dir/dir_runs/dir_figuras/
+    clip_grad_norm_max valem para todas as configurações da grade
+    (repassados a cada treinar_variacao).
     """
     resultados = []
     for i, config_original in enumerate(grade_configuracoes):
@@ -377,6 +388,7 @@ def buscar_melhor_configuracao(
             device=device,
             nome=nome,
             pos_weight=pos_weight,
+            clip_grad_norm_max=clip_grad_norm_max,
             epocas=epocas,
             checkpoint_dir=checkpoint_dir,
             dir_runs=dir_runs,
