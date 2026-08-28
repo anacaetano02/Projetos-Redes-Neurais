@@ -52,7 +52,7 @@ def treinar_epoca(modelo, loader, loss_fn, otimizador, device: str, clip_grad_no
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
         otimizador.zero_grad()
-        out = modelo(X_batch).squeeze()
+        out = modelo(X_batch)
         loss = loss_fn(out, y_batch)
         loss.backward()
 
@@ -71,6 +71,12 @@ def treinar_epoca(modelo, loader, loss_fn, otimizador, device: str, clip_grad_no
         loss_total += loss.item()
         n_batches += 1
 
+    assert n_batches > 0, (
+        "loader não produziu nenhum batch — com drop_last=True (padrão em "
+        "preparar_dataloaders), isso acontece se o conjunto de treino tiver "
+        "menos linhas que batch_size. Reduza batch_size ou confirme o "
+        "tamanho do conjunto de treino."
+    )
     return loss_total / n_batches, grad_norm_total / n_batches
 
 @torch.no_grad()
@@ -80,7 +86,7 @@ def avaliar(modelo, loader, loss_fn, device: str) -> float:
     n_batches = 0
     for X_batch, y_batch in loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        out = modelo(X_batch).squeeze()
+        out = modelo(X_batch)
         loss = loss_fn(out, y_batch)
         loss_total += loss.item()
         n_batches += 1
@@ -120,11 +126,15 @@ def treinar_modelo(modelo, loader_treino, loader_val, loss_fn, otimizador, epoca
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 counter_es = 0
-                # Salvando checkpoint físico estável
+                # Salvando checkpoint físico estável — "config" torna o
+                # checkpoint autodescritivo (arquitetura recuperável sem
+                # precisar lembrar os hiperparâmetros usados na chamada
+                # que o gerou), quando o modelo expõe .resumo() (MLP expõe).
                 torch.save({
                     "epoca": epoch,
                     "state_dict": modelo.state_dict(),
-                    "val_loss": val_loss
+                    "val_loss": val_loss,
+                    "config": modelo.resumo() if hasattr(modelo, "resumo") else None,
                 }, checkpoint_path)
             else:
                 counter_es += 1
@@ -147,6 +157,21 @@ def carregar_melhor_modelo(modelo, checkpoint_path: str, device: str = "cpu"):
     print(f"Modelo recarregado com sucesso! Época: {checkpoint['epoca']} | Val Loss: {checkpoint['val_loss']:.4f}")
     return modelo
 
+def mostrar_historico(historico: dict, nome_modelo: str = "") -> pl.DataFrame:
+    """Exibe o histórico de treino (train_loss, val_loss, grad_norm, lr por época) como tabela — mais fácil de revisar/exportar do que rolar pelos prints época a época."""
+    n_epocas = len(historico["train_loss"])
+    tabela = pl.DataFrame({
+        "epoca": list(range(1, n_epocas + 1)),
+        "train_loss": historico["train_loss"],
+        "val_loss": historico["val_loss"],
+        "grad_norm": historico["grad_norm"],
+        "lr": historico["lr"],
+    })
+
+    titulo = f"Histórico de treino - {nome_modelo}" if nome_modelo else "Histórico de treino"
+    log_etapa(titulo, tabela)
+    return tabela
+
 def registrar_experimento(nome: str, tipo: str, hiperparametros: dict, metricas: dict, notas: str = ""):
     """Registra o experimento na tabela global."""
     _experimentos.append({
@@ -157,6 +182,63 @@ def registrar_experimento(nome: str, tipo: str, hiperparametros: dict, metricas:
         "metricas": metricas,
         "notas": notas
     })
+
+def limpar_experimentos() -> None:
+    """Zera a lista de experimentos em memória — útil ao re-rodar o notebook do zero."""
+    _experimentos.clear()
+
+def tabela_experimentos(tipo_filtro: str | None = None) -> pl.DataFrame:
+    """Monta uma tabela comparável a partir de TODOS os experimentos registrados (hiperparâmetros e métricas achatados em colunas hp_/metrica_), sem separar por família classificação/regressão."""
+    registros = _experimentos
+    if tipo_filtro:
+        registros = [r for r in registros if r["tipo"] == tipo_filtro]
+
+    linhas = []
+    for r in registros:
+        linha = {"nome": r["nome"], "tipo": r["tipo"], "data": r["data"]}
+        linha.update({f"hp_{k}": str(v) for k, v in r["hiperparametros"].items()})
+        linha.update({f"metrica_{k}": v for k, v in r["metricas"].items()})
+        linha["notas"] = r["notas"]
+        linhas.append(linha)
+
+    df = pl.DataFrame(linhas) if linhas else pl.DataFrame()
+    titulo = "Tabela de experimentos" + (f" - {tipo_filtro}" if tipo_filtro else "")
+    log_etapa(titulo, df)
+    return df
+
+def comparar_com_baseline(tipo_problema: str, metrica_chave: str) -> pl.DataFrame:
+    """
+    Compara todos os experimentos de um tipo (ex.: "classificacao") contra
+    o baseline correspondente (tipo="baseline_<tipo_problema>"), calculando
+    a diferença (delta) na métrica-chave informada. Se houver mais de um
+    baseline registrado, usa o mais recente.
+    """
+    baseline = [r for r in _experimentos if r["tipo"] == f"baseline_{tipo_problema}"]
+    modelos = [r for r in _experimentos if r["tipo"] == tipo_problema]
+
+    if not baseline:
+        log_nota(
+            f"Nenhum baseline registrado para '{tipo_problema}' ainda — "
+            f"registre com registrar_experimento(tipo='baseline_{tipo_problema}', ...)."
+        )
+        return pl.DataFrame()
+
+    valor_baseline = baseline[-1]["metricas"].get(metrica_chave)
+
+    linhas = []
+    for r in modelos:
+        valor_modelo = r["metricas"].get(metrica_chave)
+        delta = (valor_modelo - valor_baseline) if (valor_modelo is not None and valor_baseline is not None) else None
+        linhas.append({
+            "nome": r["nome"],
+            metrica_chave: valor_modelo,
+            f"baseline_{metrica_chave}": valor_baseline,
+            "delta": delta,
+        })
+
+    df = pl.DataFrame(linhas) if linhas else pl.DataFrame()
+    log_etapa(f"Comparação com baseline - {tipo_problema} ({metrica_chave})", df)
+    return df
 
 def _tabela_metricas(familia: str, apenas_busca: bool | None) -> pl.DataFrame:
     registros = [r for r in _experimentos if familia in r["tipo"]]
@@ -329,11 +411,7 @@ def treinar_variacao(
         nome=nome,
         tipo=f"busca_{tipo_problema}",
         hiperparametros={
-            "camadas_ocultas": camadas_ocultas,
-            "ativacao": ativacao.__name__,
-            "dropout": dropout,
-            "usar_batchnorm": usar_batchnorm,
-            "inicializacao": inicializacao,
+            **modelo.resumo(),
             "lr": lr,
             "weight_decay": weight_decay,
         },
