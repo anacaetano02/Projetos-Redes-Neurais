@@ -3,7 +3,7 @@ Módulo src/data.py
 Consolida o carregamento Polars, a montagem do dataset de trabalho
 (seleção de colunas + criação dos targets), engenharia de atributos,
 particionamento temporal, padronização e conversão para DataLoader do
-PyTorch. Não cobre aquisição (download do Kaggle) — isso fica no notebook.
+PyTorch.
 """
 import os
 import polars as pl
