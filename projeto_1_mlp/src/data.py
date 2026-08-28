@@ -3,7 +3,7 @@ Módulo src/data.py
 Consolida o carregamento Polars, a montagem do dataset de trabalho
 (seleção de colunas + criação dos targets), engenharia de atributos,
 particionamento temporal, padronização e conversão para DataLoader do
-PyTorch. Não cobre aquisição (download do Kaggle) — isso fica no notebook.
+PyTorch.
 """
 import os
 import polars as pl
@@ -165,9 +165,7 @@ def mapear_emp_length(df: pl.DataFrame) -> pl.DataFrame:
     emp_length mapeada para escala ordinal (preserva ordem — diferente de
     One-Hot, que destruiria a noção de "mais"/"menos" tempo de emprego).
     Nulos E categorias não reconhecidas viram emp_length_num=0 + flag
-    emp_length_missing=1 (só nulos verdadeiros marcam a flag; a coluna
-    'bogus'/inesperada some junto do cast, mas isso não deveria acontecer
-    com o schema conhecido do Lending Club).
+    emp_length_missing=1.
     """
     emp_length_map = {
         "< 1 year": 0, "1 year": 1, "2 years": 2, "3 years": 3, "4 years": 4,
