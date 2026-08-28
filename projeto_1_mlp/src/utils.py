@@ -1,21 +1,23 @@
 """
 Módulo src/utils.py
-Consolida as ferramentas de logging de etapas e de diagnósticos visuais
-e analíticos.
+Consolida as ferramentas de logging de etapas, EDA visual de imagens e
+diagnósticos de treino/avaliação (classificação multiclasse).
+
+Não importa nada de src/data.py de propósito — data.py importa log_etapa/
+log_nota daqui, então a direção inversa criaria import circular. Onde uma
+função precisaria de uma constante ou helper "de dados" (a lista de
+classes, uma transform), ela recebe isso como parâmetro em vez de
+importar diretamente.
 """
 import os
+import random
+
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import torch
-from sklearn.metrics import (
-    confusion_matrix,
-    classification_report,
-    roc_auc_score,
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-)
+from PIL import Image, UnidentifiedImageError
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 
 _log_relatorio = []
 
@@ -23,12 +25,12 @@ def log_etapa(titulo: str, conteudo) -> None:
     """Imprime no notebook e guarda em markdown para exportar depois."""
     print(f"\n{'=' * 60}\n{titulo}\n{'=' * 60}")
     print(conteudo)
-    _log_relatorio.append(f"## {titulo}\n\n\n{conteudo}\n\n")
+    _log_relatorio.append(f"## {titulo}\n\n```\n{conteudo}\n```\n")
 
 def log_nota(texto: str) -> None:
     """Guarda observações e decisões sem imprimir blocos de tabela."""
     print(f"\nNOTA: {texto}")
-    _log_relatorio.append(f">  **Nota:**  {texto}\n")
+    _log_relatorio.append(f"> **Nota:** {texto}\n")
 
 def exportar_log(path: str = "outputs/report_assets/log_eda.md") -> None:
     diretorio = os.path.dirname(path)
@@ -39,9 +41,153 @@ def exportar_log(path: str = "outputs/report_assets/log_eda.md") -> None:
     print(f"\nLog exportado para {path} ({len(_log_relatorio)} entradas)")
 
 def limpar_log() -> None:
+    """Reinicia o acumulador — útil ao re-rodar o notebook do zero."""
     _log_relatorio.clear()
 
 DIR_FIGURAS = "outputs/report_assets"
+
+# ---------------------------------------------------------------------------
+# EDA visual e estatística das imagens
+# ---------------------------------------------------------------------------
+
+def amostra_visual_por_classe(
+    df: pl.DataFrame,
+    coluna_classe: str = "dx",
+    coluna_caminho: str = "caminho",
+    n_por_classe: int = 3,
+    seed: int = 42,
+) -> None:
+    """Plota uma grade com n_por_classe imagens de exemplo para cada classe em coluna_classe."""
+    random.seed(seed)
+    classes = sorted(df[coluna_classe].unique().to_list())
+
+    fig, axes = plt.subplots(
+        len(classes), n_por_classe, figsize=(3 * n_por_classe, 3 * len(classes))
+    )
+    if len(classes) == 1:
+        axes = axes.reshape(1, -1)
+
+    for i, classe in enumerate(classes):
+        caminhos_classe = (
+            df.filter(pl.col(coluna_classe) == classe)[coluna_caminho]
+            .drop_nulls()
+            .to_list()
+        )
+        amostrados = random.sample(caminhos_classe, min(n_por_classe, len(caminhos_classe)))
+
+        for j in range(n_por_classe):
+            ax = axes[i, j]
+            ax.axis("off")
+            if j < len(amostrados):
+                try:
+                    img = Image.open(amostrados[j])
+                    ax.imshow(img)
+                except (UnidentifiedImageError, OSError):
+                    ax.set_title("erro ao abrir", fontsize=8, color="red")
+            if j == 0:
+                ax.set_ylabel(classe, fontsize=10)
+                ax.axis("on")
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+    plt.tight_layout()
+    plt.show()
+
+    log_etapa(
+        "amostra_visual_por_classe",
+        f"Grade de {n_por_classe} imagens x {len(classes)} classes exibida (seed={seed}).",
+    )
+
+def checar_imagens_corrompidas(df: pl.DataFrame, coluna_caminho: str = "caminho") -> list[str]:
+    """Tenta abrir todas as imagens do inventário. Retorna a lista de caminhos que falharam."""
+    caminhos = df[coluna_caminho].drop_nulls().to_list()
+    corrompidas = []
+
+    for caminho in caminhos:
+        try:
+            with Image.open(caminho) as img:
+                img.verify()
+        except (UnidentifiedImageError, OSError):
+            corrompidas.append(caminho)
+
+    log_etapa(
+        "checar_imagens_corrompidas",
+        f"{len(caminhos)} imagens verificadas, {len(corrompidas)} corrompidas/ilegíveis.",
+    )
+    if corrompidas:
+        log_nota(f"Imagens corrompidas encontradas: {corrompidas[:10]}{'...' if len(corrompidas) > 10 else ''}")
+
+    return corrompidas
+
+def distribuicao_dimensoes(df: pl.DataFrame, coluna_caminho: str = "caminho", amostra: int | None = 500) -> pl.DataFrame:
+    """Lê as dimensões (largura, altura, modo de cor) de uma amostra de imagens."""
+    caminhos = df[coluna_caminho].drop_nulls().to_list()
+    if amostra is not None and amostra < len(caminhos):
+        caminhos = random.sample(caminhos, amostra)
+
+    registros = []
+    for caminho in caminhos:
+        try:
+            with Image.open(caminho) as img:
+                registros.append(
+                    {"caminho": caminho, "largura": img.width, "altura": img.height, "modo": img.mode}
+                )
+        except (UnidentifiedImageError, OSError):
+            continue
+
+    df_dim = pl.DataFrame(registros)
+
+    dims_unicas = df_dim.select(["largura", "altura", "modo"]).unique()
+    log_etapa(
+        "distribuicao_dimensoes",
+        f"{len(caminhos)} imagens inspecionadas. "
+        f"{dims_unicas.height} combinação(ões) única(s) de (largura, altura, modo):\n{dims_unicas}",
+    )
+
+    return df_dim
+
+def estatisticas_pixel(df: pl.DataFrame, coluna_caminho: str = "caminho", amostra: int = 200, seed: int = 42) -> dict:
+    """Média e desvio padrão de pixel por canal (RGB) sobre uma amostra — insumo para a normalização do preparar_dataloaders."""
+    random.seed(seed)
+    caminhos = df[coluna_caminho].drop_nulls().to_list()
+    amostrados = random.sample(caminhos, min(amostra, len(caminhos)))
+
+    somas = np.zeros(3)
+    somas_sq = np.zeros(3)
+    n_pixels = 0
+
+    for caminho in amostrados:
+        try:
+            with Image.open(caminho) as img:
+                arr = np.asarray(img.convert("RGB"), dtype=np.float64) / 255.0
+        except (UnidentifiedImageError, OSError):
+            continue
+        somas += arr.sum(axis=(0, 1))
+        somas_sq += (arr ** 2).sum(axis=(0, 1))
+        n_pixels += arr.shape[0] * arr.shape[1]
+
+    media = somas / n_pixels
+    variancia = (somas_sq / n_pixels) - media ** 2
+    desvio = np.sqrt(np.maximum(variancia, 0))
+
+    resultado = {
+        "media_rgb": tuple(media.round(4)),
+        "desvio_rgb": tuple(desvio.round(4)),
+        "n_imagens_amostradas": len(amostrados),
+    }
+
+    log_etapa(
+        "estatisticas_pixel",
+        f"Sobre {len(amostrados)} imagens: média RGB={resultado['media_rgb']}, "
+        f"desvio RGB={resultado['desvio_rgb']}.",
+    )
+
+    return resultado
+
+# ---------------------------------------------------------------------------
+# Diagnóstico de treino (curvas de loss / gradiente) — mesmo padrão do
+# Projeto 1, reaproveitando historico["train_loss"/"val_loss"/"grad_norm"]
+# ---------------------------------------------------------------------------
 
 def plot_curvas_loss(historico: dict, nome_modelo: str, salvar_dir: str = DIR_FIGURAS) -> str:
     """Plota treino vs. validação e sugere um rótulo heurístico de convergência."""
@@ -63,10 +209,6 @@ def plot_curvas_loss(historico: dict, nome_modelo: str, salvar_dir: str = DIR_FI
     plt.savefig(caminho, bbox_inches="tight")
     plt.close()
 
-    # Heurística relativa à escala da própria loss, em vez de limiares
-    # absolutos (que não fazem sentido comparando BCE com MSE): olha o
-    # crescimento do gap treino-validação entre a metade e o fim do
-    # treino, e a variância época a época da validação.
     metade = max(1, len(perdas_treino) // 2)
     gap_final = perdas_val[-1] - perdas_treino[-1]
     gap_metade = perdas_val[metade] - perdas_treino[metade] if metade < len(perdas_val) else gap_final
@@ -94,14 +236,17 @@ def plot_gradient_norm(historico: dict, nome_modelo: str, salvar_dir: str = DIR_
     if "grad_norm" not in historico or not historico["grad_norm"]:
         return ""
     os.makedirs(salvar_dir, exist_ok=True)
-    grad_norm = historico["grad_norm"]
-    epocas = range(1, len(grad_norm) + 1)
+    grad_norm = [g for g in historico["grad_norm"] if np.isfinite(g)]
+    if not grad_norm:
+        log_nota(f"[{nome_modelo}] Nenhum valor finito de grad_norm no histórico — gráfico não gerado.")
+        return ""
+    epocas_validas = range(1, len(historico["grad_norm"]) + 1)
 
     plt.figure(figsize=(8, 5))
-    plt.plot(epocas, grad_norm, label="Gradient Norm", color="purple", marker="^")
+    plt.plot(epocas_validas, historico["grad_norm"], label="Gradient Norm", color="purple", marker="^")
     plt.title(f"Evolução da Norma dos Gradientes - {nome_modelo}")
     plt.xlabel("Épocas")
-    plt.ylabel("Norma L2")
+    plt.ylabel("Norma L2 (pós-clipping)")
     plt.legend()
     plt.grid(True, linestyle=":")
 
@@ -119,272 +264,167 @@ def plot_gradient_norm(historico: dict, nome_modelo: str, salvar_dir: str = DIR_
     if maximo > media * 5:
         alertas.append(f"possível exploding gradient (pico de {maximo:.2f}, ~{maximo / media:.1f}x a média)")
 
+    n_overflow = sum(historico.get("batches_overflow", []))
+    if n_overflow:
+        alertas.append(f"{n_overflow} batch(es) com overflow de AMP ao longo do treino (grad_norm não finita)")
+
     log_nota(
         f"[{nome_modelo}] Gradient norm - média: {media:.4f}, min: {minimo:.4f}, "
         f"máx: {maximo:.4f}. " + ("; ".join(alertas) if alertas else "Sem sinal de vanishing/exploding pelas regras heurísticas.")
     )
     return caminho
 
-def capturar_distribuicao_ativacoes(modelo, loader, device: str, nome_modelo: str, salvar_dir: str = DIR_FIGURAS) -> dict:
-    """Avalia a distribuição de ativações ocultas para mapear neurônios mortos."""
+# ---------------------------------------------------------------------------
+# Avaliação (classificação multiclasse) e interpretação de erro
+# ---------------------------------------------------------------------------
+
+def metricas_a_partir_de_predicoes(y_true: np.ndarray, y_pred: np.ndarray, classes: list[str]) -> dict:
+    """F1-macro + relatório completo por classe + matriz de confusão."""
+    # labels=range(len(classes)) força classification_report/confusion_matrix
+    # a sempre considerar as 7 classes, mesmo que alguma (tipicamente 'df'/
+    # 'vasc', as mais raras) não apareça em y_true/y_pred de um lote/split
+    # específico — sem isso, target_names (7 nomes) e as classes REALMENTE
+    # observadas podem divergir em contagem, e o sklearn lança ValueError.
+    labels = list(range(len(classes)))
+    f1_macro = f1_score(y_true, y_pred, labels=labels, average="macro")
+    relatorio = classification_report(
+        y_true, y_pred, labels=labels, target_names=classes, output_dict=True, zero_division=0
+    )
+    matriz = confusion_matrix(y_true, y_pred, labels=labels)
+
+    log_etapa(
+        "metricas",
+        f"F1-macro={f1_macro:.4f}\n"
+        + classification_report(y_true, y_pred, labels=labels, target_names=classes, zero_division=0),
+    )
+
+    return {"f1_macro": f1_macro, "accuracy": relatorio["accuracy"], "relatorio_por_classe": relatorio, "matriz_confusao": matriz}
+
+def avaliar_baseline(resultado_baseline: dict, X: np.ndarray, y_true: np.ndarray, classes: list[str]) -> dict:
+    """Avalia o modelo do baseline (dict retornado por models.treinar_baseline) sobre features já extraídas (data.construir_matriz_features)."""
+    X_scaled = resultado_baseline["scaler"].transform(X)
+    y_pred = resultado_baseline["modelo"].predict(X_scaled)
+    return metricas_a_partir_de_predicoes(y_true, y_pred, classes)
+
+def avaliar_cnn(modelo: torch.nn.Module, dataloader, classes: list[str], device: str = None) -> dict:
+    """Avalia a CNN/LSTM (em modo eval, sem dropout) num DataLoader."""
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    modelo = modelo.to(device)
     modelo.eval()
-    X_amostra, _ = next(iter(loader))
-    X_amostra = X_amostra.to(device)
 
-    try:
-        with torch.no_grad():
-            out, ativacoes = modelo(X_amostra, retornar_ativacoes=True)
-    except TypeError:
-        log_nota("O modelo não suporta retornar_ativacoes=True em seu forward pass.")
-        return {}
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for imgs, rotulos in dataloader:
+            imgs = imgs.to(device)
+            saida = modelo(imgs)
+            preditos = saida.argmax(dim=1).cpu().numpy()
 
-    os.makedirs(salvar_dir, exist_ok=True)
-    relatorio = {}
-    for nome_camada, valores in ativacoes.items():
-        val_np = valores.cpu().numpy().flatten()
-        pct_zeros = float((val_np == 0.0).mean() * 100)
-        relatorio[nome_camada] = {
-            "pct_zeros": pct_zeros,
-            "media": float(val_np.mean()),
-            "std": float(val_np.std()),
-        }
+            y_true.extend(rotulos.numpy())
+            y_pred.extend(preditos)
 
-        caminho = f"{salvar_dir}/ativacoes_{nome_modelo}_{nome_camada}.png"
-        plt.figure(figsize=(8, 4))
-        plt.hist(val_np, bins=50)
-        plt.title(f"Ativações - {nome_modelo}/{nome_camada} ({pct_zeros:.1f}% em zero)")
+    return metricas_a_partir_de_predicoes(np.array(y_true), np.array(y_pred), classes)
+
+def plotar_matriz_confusao(matriz: np.ndarray, classes: list[str], titulo: str = "Matriz de Confusão", salvar_dir: str | None = DIR_FIGURAS, nome_modelo: str = "modelo") -> str:
+    """Heatmap da matriz de confusão, com rótulos das classes. Salva em disco se salvar_dir for informado."""
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(matriz, cmap="Blues")
+
+    ax.set_xticks(range(len(classes)))
+    ax.set_yticks(range(len(classes)))
+    ax.set_xticklabels(classes, rotation=45)
+    ax.set_yticklabels(classes)
+    ax.set_xlabel("Predito")
+    ax.set_ylabel("Real")
+    ax.set_title(titulo)
+
+    for i in range(matriz.shape[0]):
+        for j in range(matriz.shape[1]):
+            ax.text(j, i, str(matriz[i, j]), ha="center", va="center", fontsize=8)
+
+    plt.colorbar(im)
+    plt.tight_layout()
+
+    caminho = ""
+    if salvar_dir:
+        os.makedirs(salvar_dir, exist_ok=True)
+        caminho = f"{salvar_dir}/matriz_confusao_{nome_modelo}.png"
         plt.savefig(caminho, bbox_inches="tight")
-        plt.close()
-
-    log_etapa(f"Neurônios Mortos (Ativações em Zero) - {nome_modelo}", relatorio)
-    for nome_camada, stats in relatorio.items():
-        if stats["pct_zeros"] > 40:
-            log_nota(
-                f"[{nome_modelo}/{nome_camada}] {stats['pct_zeros']:.1f}% das ativações em "
-                f"zero — possível indício de neurônios mortos (ReLU). Candidato a testar "
-                f"LeakyReLU nessa configuração."
-            )
-    return relatorio
-
-def avaliar_classificacao(modelo, loader, device: str, nome_modelo: str, limiar: float = 0.5, salvar_dir: str = DIR_FIGURAS) -> dict:
-    """Roda a classificação sobre o loader de teste e calcula métricas completas."""
-    modelo.eval()
-    probs, reais = [], []
-    with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(device)
-            logits = modelo(X_batch)
-            prob = torch.sigmoid(logits).cpu().numpy()
-            probs.extend(prob)
-            reais.extend(y_batch.numpy())
-
-    probs = np.array(probs).reshape(-1)
-    reais = np.array(reais).reshape(-1)
-    preds = (probs >= limiar).astype(int)
-
-    cm = confusion_matrix(reais, preds, labels=[0, 1])
-    auc = roc_auc_score(reais, probs)
-    rep = classification_report(reais, preds, output_dict=True)
-
-    # Normalização de classes em classificação
-    # Verificando as chaves das métricas do dict do classification_report
-    key_class_1 = "1.0" if "1.0" in rep else "1"
-
-    os.makedirs(salvar_dir, exist_ok=True)
-    caminho_cm = f"{salvar_dir}/matriz_confusao_{nome_modelo}.png"
-    plt.figure(figsize=(5, 4))
-    plt.imshow(cm, cmap="Blues")
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            plt.text(j, i, str(cm[i, j]), ha="center", va="center")
-    plt.xlabel("Previsto")
-    plt.ylabel("Real")
-    plt.title(f"Matriz de Confusão - {nome_modelo}")
-    plt.colorbar()
-    plt.savefig(caminho_cm, bbox_inches="tight")
+    plt.show()
     plt.close()
+    return caminho
 
-    vn, fp, fn, vp = cm.ravel()
-    resultados = {
-        "accuracy": rep["accuracy"],
-        "precision": rep[key_class_1]["precision"] if key_class_1 in rep else 0.0,
-        "recall": rep[key_class_1]["recall"] if key_class_1 in rep else 0.0,
-        "f1": rep[key_class_1]["f1-score"] if key_class_1 in rep else 0.0,
-        "auc": auc,
-        "confusion_matrix": cm.tolist(),
-        "falsos_negativos": int(fn),
-        "falsos_positivos": int(fp),
-    }
-
-    log_etapa(f"Métricas de Classificação - {nome_modelo}", resultados)
-    log_nota(
-        f"[{nome_modelo}] Falsos negativos: {fn} (inadimplente previsto como bom "
-        f"pagador — erro mais custoso no contexto de crédito). Falsos positivos: {fp}. "
-        f"Figura salva em {caminho_cm}."
-    )
-    return resultados
-
-def avaliar_regressao(modelo, loader, device: str, nome_modelo: str) -> dict:
-    """Avalia o modelo de regressão calculando MAE, RMSE e R2."""
-    modelo.eval()
-    preds, reais = [], []
-    with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(device)
-            out = modelo(X_batch)
-            preds.extend(out.cpu().numpy())
-            reais.extend(y_batch.numpy())
-
-    preds = np.array(preds).reshape(-1)
-    reais = np.array(reais).reshape(-1)
-
-    mae = mean_absolute_error(reais, preds)
-    mse = mean_squared_error(reais, preds)
-    rmse = np.sqrt(mse)
-    r2 = r2_score(reais, preds)
-
-    resultados = {
-        "mae": mae,
-        "rmse": rmse,
-        "r2": r2
-    }
-
-    log_etapa(f"Métricas de Regressão - {nome_modelo}", resultados)
-    return resultados
-
-def perfil_distribuicao_categorica(df: pl.DataFrame, coluna: str) -> pl.DataFrame:
-    """Contagem + percentual de uma coluna categórica, já logado."""
-    resultado = (
-        df[coluna]
-        .value_counts()
-        .with_columns(
-            (pl.col("count") / pl.col("count").sum() * 100).round(2).alias("%")
-        )
-        .sort("count", descending=True)
-    )
-    log_etapa(f"Distribuição de {coluna}", resultado)
-    return resultado
-
-def perfil_skew_zero_pct(df: pl.DataFrame, colunas: list[str]) -> pl.DataFrame:
-    """Skew e percentual de zeros para uma lista de colunas numéricas — apoia a decisão de transformação (ver aplicar_transformacoes_por_regra)."""
-    skew_df = df.select([
-        pl.col(c).skew().alias(c) for c in colunas
-    ]).transpose(include_header=True, header_name="coluna", column_names=["skew"])
-
-    zero_pcts = df.select([
-        ((pl.col(c) == 0).sum() / pl.len() * 100).alias(c) for c in colunas
-    ]).transpose(include_header=True, header_name="coluna", column_names=["zero_pct"])
-
-    resumo = skew_df.join(zero_pcts, on="coluna").sort("skew", descending=True)
-    log_etapa("Perfil de skew e percentual de zeros", resumo)
-    return resumo
-
-def analisar_distribuicao_int_rate(df: pl.DataFrame, salvar_figura: str | None = f"{DIR_FIGURAS}/hist_int_rate.png") -> None:
-    """describe() + histograma de target_regressao (int_rate) — achado relevante para a profundidade da arquitetura de regressão."""
-    log_etapa("target_regressao (int_rate) - describe()", df["target_regressao"].describe())
-
-    if salvar_figura:
-        diretorio = os.path.dirname(salvar_figura)
-        if diretorio:
-            os.makedirs(diretorio, exist_ok=True)
-        plt.figure(figsize=(10, 5))
-        plt.hist(df["target_regressao"].to_numpy(), bins=80, edgecolor="black", alpha=0.7)
-        plt.xlabel("int_rate (%)")
-        plt.ylabel("Frequência")
-        plt.title("Distribuição de int_rate")
-        plt.savefig(salvar_figura, bbox_inches="tight")
-        plt.close()
-        log_nota(f"Histograma de int_rate salvo em {salvar_figura}.")
-
-    log_nota(
-        "int_rate pode apresentar distribuição multimodal (picos recorrentes), "
-        "consistente com o pricing histórico do Lending Club por sub_grade — "
-        "variável removida do conjunto de features por vazamento condicional. "
-        "Se confirmado visualmente no histograma acima, é argumento para maior "
-        "profundidade na arquitetura de regressão, já que uma rede rasa tende a "
-        "suavizar os picos numa aproximação contínua média."
-    )
-
-def checar_correlacao(df: pl.DataFrame, colunas: list[str], limiar: float = 0.85) -> pl.DataFrame:
-    """Pares de colunas numéricas com |correlação de Pearson| acima do limiar."""
-    corr_matrix = df.select(colunas).corr()
-
-    pares = []
-    for i, col_i in enumerate(colunas):
-        for j, col_j in enumerate(colunas):
-            if j <= i:
-                continue
-            r = corr_matrix[col_i][j]
-            if r is not None and abs(r) > limiar:
-                pares.append({"coluna_1": col_i, "coluna_2": col_j, "correlacao": round(r, 3)})
-
-    pares_df = pl.DataFrame(pares) if pares else pl.DataFrame({"coluna_1": [], "coluna_2": [], "correlacao": []})
-    if len(pares_df) > 0:
-        pares_df = pares_df.sort("correlacao", descending=True)
-
-    log_etapa(f"Pares de features com |r| > {limiar}", pares_df)
-    log_nota(
-        f"{len(pares_df)} pares excederam o limiar de {limiar}. "
-        f"Decisão a documentar: remover uma de cada par redundante, "
-        f"ou manter todas e delegar a redundância à regularização (weight decay)."
-    )
-    return pares_df
-
-def calcular_permutation_importance(
-    modelo,
-    X_val_t: torch.Tensor,
-    y_val_t: torch.Tensor,
-    loss_fn,
-    colunas_features: list[str],
-    device: str,
-    n_repeats: int = 3,
-    seed: int = 42,
-) -> dict:
+def exemplos_classificados_errado(
+    modelo: torch.nn.Module,
+    df_eval: pl.DataFrame,
+    transform,
+    classes: list[str],
+    n_por_par: int = 3,
+    device: str = None,
+) -> pl.DataFrame:
     """
-    Para cada coluna, embaralha seus valores (n_repeats vezes, para
-    reduzir ruído de uma única permutação) e mede o AUMENTO da loss em
-    relação à loss base (sem embaralhar nada), sobre o conjunto de
-    VALIDAÇÃO — não o teste, já que decidir quais features manter é uma
-    escolha de design de modelo, não uma avaliação final.
+    Roda o modelo sobre df_eval, identifica os pares (classe_real, classe_predita)
+    mais frequentes de ERRO, e plota exemplos visuais de cada um dos 3 pares
+    mais comuns. Retorna o DataFrame de erros completo, não só os plotados.
 
-    Importância alta = a coluna carrega sinal real (embaralhar piora
-    muito a loss). Importância perto de zero ou negativa = a coluna não
-    contribui (ou até atrapalha) o desempenho do modelo.
+    transform: a mesma transform (resize + normalização) usada no treino —
+    monte via data.montar_transform(media_rgb, desvio_rgb) e passe aqui,
+    em vez desta função importar de data.py (evita import circular).
     """
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    modelo = modelo.to(device)
     modelo.eval()
-    torch.manual_seed(seed)
 
+    caminhos = df_eval["caminho"].to_list()
+
+    predicoes = []
     with torch.no_grad():
-        loss_base = loss_fn(modelo(X_val_t.to(device)), y_val_t.to(device)).item()
+        for caminho in caminhos:
+            img = Image.open(caminho).convert("RGB")
+            img_t = transform(img).unsqueeze(0).to(device)
+            saida = modelo(img_t)
+            pred_idx = saida.argmax(dim=1).item()
+            predicoes.append(classes[pred_idx])
 
-    importancias = {}
-    n = X_val_t.size(0)
-    for i, nome_col in enumerate(colunas_features):
-        pioras = []
-        for _ in range(n_repeats):
-            X_perm = X_val_t.clone()
-            idx = torch.randperm(n)
-            X_perm[:, i] = X_perm[idx, i]
-            with torch.no_grad():
-                loss_perm = loss_fn(modelo(X_perm.to(device)), y_val_t.to(device)).item()
-            pioras.append(loss_perm - loss_base)
-        importancias[nome_col] = float(np.mean(pioras))
-
-    importancias_ordenadas = dict(sorted(importancias.items(), key=lambda x: x[1], reverse=True))
-
-    log_etapa(f"Permutation importance (loss base={loss_base:.4f})", importancias_ordenadas)
-
-    n_nao_uteis = sum(1 for v in importancias.values() if v <= 0)
-    log_nota(
-        f"{n_nao_uteis} de {len(importancias)} features tiveram importância <= 0 "
-        f"(embaralhar não piorou ou até melhorou a loss) — candidatas a remoção."
+    df_resultado = df_eval.with_columns(pl.Series("predito", predicoes)).with_columns(
+        (pl.col("dx") != pl.col("predito")).alias("erro")
     )
 
-    return importancias_ordenadas
+    df_erros = df_resultado.filter(pl.col("erro"))
+    pares_frequentes = (
+        df_erros.group_by(["dx", "predito"])
+        .agg(pl.len().alias("n"))
+        .sort("n", descending=True)
+    )
 
-def selecionar_top_features(importancias: dict, top_k: int = 30) -> list[str]:
-    """Retorna os nomes das top_k features por importância, em ordem decrescente."""
-    ordenadas = sorted(importancias.items(), key=lambda x: x[1], reverse=True)
-    top = [nome for nome, _ in ordenadas[:top_k]]
-    log_nota(f"Selecionadas as {top_k} features mais importantes: {top}")
-    return top
+    log_etapa(
+        "exemplos_classificados_errado",
+        f"{df_erros.height} erros de {df_resultado.height} avaliados. "
+        f"Pares (real, predito) mais frequentes:\n{pares_frequentes.head(10)}",
+    )
+
+    top_pares = pares_frequentes.head(3).to_dicts()
+    if not top_pares:
+        log_nota("Nenhum erro encontrado — não há pares para exibir.")
+        return df_resultado
+
+    fig, axes = plt.subplots(len(top_pares), n_por_par, figsize=(3 * n_por_par, 3 * len(top_pares)))
+    if len(top_pares) == 1:
+        axes = axes.reshape(1, -1)
+
+    for i, par in enumerate(top_pares):
+        exemplos = df_erros.filter(
+            (pl.col("dx") == par["dx"]) & (pl.col("predito") == par["predito"])
+        )["caminho"].to_list()[:n_por_par]
+
+        for j in range(n_por_par):
+            ax = axes[i, j]
+            ax.axis("off")
+            if j < len(exemplos):
+                ax.imshow(Image.open(exemplos[j]))
+            if j == 0:
+                ax.set_title(f"real={par['dx']} / predito={par['predito']} (n={par['n']})", fontsize=9)
+
+    plt.tight_layout()
+    plt.show()
+
+    return df_resultado
