@@ -18,7 +18,6 @@ _NONLINEARITY_HE = {
 class MLP(nn.Module):
     """
     Perceptron Multicamadas parametrizável.
-    Evita o uso de nn.Sequential automático para permitir auditoria explícita de sinais e ativações.
     """
     def __init__(self, input_size: int, camadas_ocultas: list[int], ativacao: type[nn.Module] = nn.ReLU, dropout: float = 0.2, usar_batchnorm: bool = True, inicializacao: str | None = "he"):
         super().__init__()
@@ -37,7 +36,16 @@ class MLP(nn.Module):
         self.output_layer = nn.Linear(last_dim, 1)
         self.activation = ativacao()
         self.dropout = nn.Dropout(p=dropout)
-        
+
+        self._config = {
+            "input_size": input_size,
+            "camadas_ocultas": list(camadas_ocultas),
+            "ativacao": ativacao.__name__,
+            "dropout": dropout,
+            "usar_batchnorm": usar_batchnorm,
+            "inicializacao": inicializacao,
+        }
+
         # Inicialização de pesos orientada por teoria matemática.
         # Aplicada só nas camadas ocultas: output_layer não tem ativação
         # subsequente, então a premissa do He/Xavier não se sustenta nela.
@@ -76,6 +84,10 @@ class MLP(nn.Module):
         if retornar_ativacoes:
             return logits, ativacoes
         return logits
+
+    def resumo(self) -> dict:
+        """Dicionário de configuração da arquitetura, pronto para registrar_experimento/checkpoint — não inclui hiperparâmetros de treino (lr, batch_size), que vivem fora do modelo."""
+        return dict(self._config)
 
 def criar_mlp_classificacao_padrao(input_size: int) -> MLP:
     return MLP(input_size=input_size, camadas_ocultas=[128, 64], ativacao=nn.ReLU, dropout=0.2, usar_batchnorm=True, inicializacao="he")
