@@ -329,3 +329,62 @@ def checar_correlacao(df: pl.DataFrame, colunas: list[str], limiar: float = 0.85
         f"ou manter todas e delegar a redundância à regularização (weight decay)."
     )
     return pares_df
+
+def calcular_permutation_importance(
+    modelo,
+    X_val_t: torch.Tensor,
+    y_val_t: torch.Tensor,
+    loss_fn,
+    colunas_features: list[str],
+    device: str,
+    n_repeats: int = 3,
+    seed: int = 42,
+) -> dict:
+    """
+    Para cada coluna, embaralha seus valores (n_repeats vezes, para
+    reduzir ruído de uma única permutação) e mede o AUMENTO da loss em
+    relação à loss base (sem embaralhar nada), sobre o conjunto de
+    VALIDAÇÃO — não o teste, já que decidir quais features manter é uma
+    escolha de design de modelo, não uma avaliação final.
+
+    Importância alta = a coluna carrega sinal real (embaralhar piora
+    muito a loss). Importância perto de zero ou negativa = a coluna não
+    contribui (ou até atrapalha) o desempenho do modelo.
+    """
+    modelo.eval()
+    torch.manual_seed(seed)
+
+    with torch.no_grad():
+        loss_base = loss_fn(modelo(X_val_t.to(device)), y_val_t.to(device)).item()
+
+    importancias = {}
+    n = X_val_t.size(0)
+    for i, nome_col in enumerate(colunas_features):
+        pioras = []
+        for _ in range(n_repeats):
+            X_perm = X_val_t.clone()
+            idx = torch.randperm(n)
+            X_perm[:, i] = X_perm[idx, i]
+            with torch.no_grad():
+                loss_perm = loss_fn(modelo(X_perm.to(device)), y_val_t.to(device)).item()
+            pioras.append(loss_perm - loss_base)
+        importancias[nome_col] = float(np.mean(pioras))
+
+    importancias_ordenadas = dict(sorted(importancias.items(), key=lambda x: x[1], reverse=True))
+
+    log_etapa(f"Permutation importance (loss base={loss_base:.4f})", importancias_ordenadas)
+
+    n_nao_uteis = sum(1 for v in importancias.values() if v <= 0)
+    log_nota(
+        f"{n_nao_uteis} de {len(importancias)} features tiveram importância <= 0 "
+        f"(embaralhar não piorou ou até melhorou a loss) — candidatas a remoção."
+    )
+
+    return importancias_ordenadas
+
+def selecionar_top_features(importancias: dict, top_k: int = 30) -> list[str]:
+    """Retorna os nomes das top_k features por importância, em ordem decrescente."""
+    ordenadas = sorted(importancias.items(), key=lambda x: x[1], reverse=True)
+    top = [nome for nome, _ in ordenadas[:top_k]]
+    log_nota(f"Selecionadas as {top_k} features mais importantes: {top}")
+    return top
