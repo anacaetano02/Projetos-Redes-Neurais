@@ -240,6 +240,59 @@ def comparar_com_baseline(tipo_problema: str, metrica_chave: str) -> pl.DataFram
     log_etapa(f"Comparação com baseline - {tipo_problema} ({metrica_chave})", df)
     return df
 
+def comparar_resultados_teste(tipo_problema: str, metrica_chave: str, maior_e_melhor: bool = True) -> pl.DataFrame:
+    """
+    Filtra EXCLUSIVAMENTE as avaliações feitas no conjunto de TESTE
+    (tipo="baseline_<tipo_problema>" e tipo="<tipo_problema>" — exclui
+    "busca_<tipo_problema>", que só tem métricas de validação). Ordena
+    pela métrica-chave e declara o vencedor via log_nota — não presume
+    que a vencedora da busca por validação também vence no teste (podem
+    divergir, e isso é um achado a reportar, não a esconder).
+
+    maior_e_melhor: True para métricas onde maior é melhor (accuracy,
+    f1, r2); False para onde menor é melhor (mae, rmse).
+    """
+    tipos_validos = {f"baseline_{tipo_problema}", tipo_problema}
+    registros = [r for r in _experimentos if r["tipo"] in tipos_validos]
+
+    linhas = [
+        {"nome": r["nome"], "tipo": r["tipo"], metrica_chave: r["metricas"].get(metrica_chave)}
+        for r in registros
+    ]
+    df = pl.DataFrame(linhas) if linhas else pl.DataFrame()
+    if len(df) > 0:
+        df = df.sort(metrica_chave, descending=maior_e_melhor)
+
+    log_etapa(f"Comparação final no TESTE - {tipo_problema} ({metrica_chave})", df)
+
+    valores = [(l["nome"], l[metrica_chave]) for l in linhas if l[metrica_chave] is not None]
+    if valores:
+        melhor_nome, melhor_valor = (
+            max(valores, key=lambda x: x[1]) if maior_e_melhor else min(valores, key=lambda x: x[1])
+        )
+        log_nota(
+            f"Melhor resultado no TESTE ({tipo_problema}, {metrica_chave}): "
+            f"'{melhor_nome}' = {melhor_valor:.4f}. Total de {len(valores)} entradas comparadas."
+        )
+
+    return df
+
+def importar_experimentos(path_json: str = "outputs/report_assets/experimentos.json") -> int:
+    """
+    Recarrega experimentos de uma exportação anterior (exportar_experimentos)
+    para dentro de _experimentos — útil após um crash/reinício de runtime,
+    quando o histórico em memória foi perdido mas já havia sido exportado
+    antes do crash. Adiciona aos registros existentes (não sobrescreve);
+    rode limpar_experimentos() antes se quiser substituir em vez de
+    acumular duplicatas.
+    """
+    import json
+    with open(path_json, "r", encoding="utf-8") as f:
+        registros = json.load(f)
+    _experimentos.extend(registros)
+    log_nota(f"{len(registros)} experimentos reimportados de '{path_json}'.")
+    return len(registros)
+
 def _tabela_metricas(familia: str, apenas_busca: bool | None) -> pl.DataFrame:
     registros = [r for r in _experimentos if familia in r["tipo"]]
     if apenas_busca is True:
@@ -342,6 +395,8 @@ def treinar_variacao(
     inicializacao: str | None = "he",
     lr: float = 1e-3,
     weight_decay: float = 1e-2,
+    otimizador_cls: type = torch.optim.AdamW,
+    otimizador_kwargs: dict | None = None,
     pos_weight=None,
     epocas: int = 30,
     paciencia_early_stopping: int = 5,
@@ -362,6 +417,11 @@ def treinar_variacao(
     scheduler_patience deve ser MENOR que paciencia_early_stopping, com
     folga suficiente para o novo LR ter algumas épocas de efeito antes do
     treino parar (ex.: scheduler_patience=2, paciencia_early_stopping=5).
+
+    otimizador_cls/otimizador_kwargs: permitem trocar o otimizador (ex.:
+    torch.optim.SGD com otimizador_kwargs={"momentum": 0.9}) na própria
+    grade de busca, para ablações de dinâmica de otimização — sem isso,
+    só dava para variar lr/weight_decay mantendo AdamW fixo.
     """
     modelo = MLP(
         input_size=input_size,
@@ -381,7 +441,7 @@ def treinar_variacao(
     else:
         raise ValueError(f"tipo_problema deve ser 'classificacao' ou 'regressao', recebido: {tipo_problema}")
 
-    otimizador = torch.optim.AdamW(modelo.parameters(), lr=lr, weight_decay=weight_decay)
+    otimizador = otimizador_cls(modelo.parameters(), lr=lr, weight_decay=weight_decay, **(otimizador_kwargs or {}))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(otimizador, mode="min", factor=0.5, patience=scheduler_patience)
 
     checkpoint_path = os.path.join(checkpoint_dir, f"{nome}.pt")
@@ -414,6 +474,8 @@ def treinar_variacao(
             **modelo.resumo(),
             "lr": lr,
             "weight_decay": weight_decay,
+            "otimizador": otimizador_cls.__name__,
+            **{f"otim_{k}": v for k, v in (otimizador_kwargs or {}).items()},
         },
         metricas={"melhor_val_loss": melhor_val_loss, "val_loss_final": historico["val_loss"][-1]},
         notas="Comparação por validação — teste ainda não avaliado.",
