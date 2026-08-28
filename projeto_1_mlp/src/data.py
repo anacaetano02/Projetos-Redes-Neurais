@@ -1,688 +1,460 @@
 """
 Módulo src/data.py
-Consolida o carregamento Polars, a montagem do dataset de trabalho
-(seleção de colunas + criação dos targets), engenharia de atributos,
-particionamento temporal, padronização e conversão para DataLoader do
-PyTorch.
+Consolida a aquisição do dataset HAM10000 (Kaggle), montagem do inventário
+particionado por lesão (evitando vazamento entre imagens da mesma lesão),
+extração de features do baseline e conversão para DataLoader do PyTorch.
 """
 import os
-import polars as pl
+import shutil
+import time
+import zipfile
+
 import numpy as np
+import polars as pl
 import torch
-from torch.utils.data import TensorDataset, DataLoader
+from PIL import Image
+from skimage.feature import local_binary_pattern
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+
 from src.utils import log_etapa, log_nota
 
-_NAO_FEATURES = {"id", "issue_d", "target_classificacao", "target_regressao"}
-_CATEGORICAS = {
-    "home_ownership", "verification_status", "purpose", "addr_state",
-    "initial_list_status", "application_type", "disbursement_method",
-}
+DATASET_SLUG = "kmader/skin-cancer-mnist-ham10000"
 
-STATUS_DESFECHO_DEFINIDO = [
-    "Fully Paid", "Charged Off", "Default",
-    "Does not meet the credit policy. Status:Fully Paid",
-    "Does not meet the credit policy. Status:Charged Off",
-]
-STATUS_INADIMPLENCIA = [
-    "Charged Off", "Does not meet the credit policy. Status:Charged Off", "Default",
-]
+# Ordem fixa das classes — define o mapeamento string -> índice inteiro.
+# Fixar isso explicitamente (em vez de deixar polars/sklearn inferir a
+# ordem sozinho) garante que o mapeamento não mude entre execuções.
+CLASSES = ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
+CLASSE_PARA_INDICE = {c: i for i, c in enumerate(CLASSES)}
+INDICE_PARA_CLASSE = {i: c for c, i in CLASSE_PARA_INDICE.items()}
 
-def carregar_df_raw(path: str, limiar_nulos_pct: float = 50.0) -> pl.DataFrame:
-    """Carrega o DataFrame de forma preguiçosa e remove colunas com alto índice de nulos."""
-    # ignore_errors=True: o export do Lending Club tem linhas de
-    # rodapé/resumo (ex.: "Total amount funded in policy code...") que não
-    # batem com o schema das colunas de dado — sem isso, o parser quebra ao
-    # encontrar a primeira linha malformada em vez de só descartá-la.
-    lf = pl.scan_csv(path, null_values=["", "NA", "NaN"], ignore_errors=True)
-    total_linhas = lf.select(pl.len()).collect().item()
-    contagem_nulos = lf.select(pl.all().null_count()).collect()
+TAMANHO_RESIZE = 128
+TAMANHO_PADRONIZADO_BASELINE = 128  # mesmo tamanho de entrada da CNN, pra comparação justa
+BINS_HISTOGRAMA_COR = 16
+RAIO_LBP = 1
+PONTOS_LBP = 8  # LBP uniforme com 8 pontos gera 8+2=10 bins
 
-    log_nota(
-        "ignore_errors=True está ativo no scan_csv — linhas malformadas "
-        "(ex.: rodapés/resumos do export do Lending Club) são descartadas "
-        f"silenciosamente durante o parsing. Total de linhas efetivamente "
-        f"lidas: {total_linhas}."
-    )
+# ---------------------------------------------------------------------------
+# Aquisição (Kaggle) e sincronização local
+# ---------------------------------------------------------------------------
 
-    resumo_nulos = (
-        contagem_nulos
-        .unpivot(variable_name="coluna", value_name="nulos")
-        .with_columns((pl.col("nulos") / total_linhas * 100).round(2).alias("percentual"))
-        .filter(pl.col("nulos") > 0)
-        .sort("percentual", descending=True)
-    )
-    log_etapa("Perfil de nulos - todas as colunas com algum nulo", resumo_nulos)
-
-    colunas_validas = [
-        col for col in contagem_nulos.columns
-        if (contagem_nulos[col][0] / total_linhas) * 100 < limiar_nulos_pct
-    ]
-    colunas_removidas = resumo_nulos.filter(pl.col("percentual") >= limiar_nulos_pct)
-    log_etapa(
-        f"Colunas removidas por >={limiar_nulos_pct}% de nulos ({colunas_removidas.height} colunas)",
-        colunas_removidas,
-    )
-
-    return lf.select(colunas_validas).collect()
-
-def montar_dataset_bruto(df_raw: pl.DataFrame, colunas_trabalho: list[str]) -> pl.DataFrame:
+def autenticar_kaggle(token_path: str):
     """
-    Seleciona a lista de colunas curada e cria os targets a partir de
-    loan_status (inadimplência) e int_rate (taxa de juros) — o CSV bruto
-    do Lending Club não tem target_classificacao/target_regressao prontos.
+    Lê o token novo do Kaggle (formato KGAT_...) e autentica.
 
-    Mantém só empréstimos com desfecho definido (Fully Paid/Charged Off/
-    Default e as variantes "Does not meet the credit policy") — Current,
-    Late e In Grace Period não têm rótulo válido de inadimplência ainda.
-
-    colunas_trabalho precisa incluir 'loan_status' e 'int_rate' (consumidos
-    aqui e descartados) além de 'id'/'issue_d' (preservados — id para
-    rastreabilidade, issue_d para anos_historico_credito e o split temporal).
+    O pacote `kaggle` se autentica sozinho no `import`, ao encontrar
+    KAGGLE_API_TOKEN no ambiente, e consome essa variável no processo.
+    Por isso usamos o objeto `kaggle.api` (já autenticado) em vez de criar
+    uma instância própria de KaggleApi().
     """
-    colunas_disponiveis = [c for c in colunas_trabalho if c in df_raw.columns]
-    colunas_faltando = sorted(set(colunas_trabalho) - set(colunas_disponiveis))
-    if colunas_faltando:
+    if not os.path.exists(token_path):
+        raise FileNotFoundError(
+            f"Token do Kaggle não encontrado em '{token_path}'. "
+            "Gere um novo token em kaggle.com/settings/api e salve o arquivo nesse caminho."
+        )
+
+    with open(token_path, "r", encoding="utf-8") as f:
+        token = f.read().strip()
+    if not token.startswith("KGAT_"):
         log_nota(
-            f"{len(colunas_faltando)} coluna(s) da lista curada não estavam em df_raw "
-            f"(removidas pelo filtro de nulos ou ausentes no schema): {colunas_faltando}"
+            "Token não começa com 'KGAT_' (formato novo esperado) — "
+            "verifique se não é um kaggle.json legado por engano."
         )
 
-    dist_status = df_raw.group_by("loan_status").len().sort("len", descending=True)
-    log_etapa("Distribuição de loan_status (antes do filtro de desfecho definido)", dist_status)
+    os.environ["KAGGLE_API_TOKEN"] = token
 
-    df = (
-        df_raw
-        .select(colunas_disponiveis)
-        .filter(pl.col("loan_status").is_in(STATUS_DESFECHO_DEFINIDO))
-        .with_columns(
-            pl.col("loan_status").is_in(STATUS_INADIMPLENCIA).cast(pl.Int8).alias("target_classificacao"),
-            pl.col("int_rate").alias("target_regressao"),
+    import kaggle  # import tardio: autentica automaticamente aqui
+
+    log_etapa("autenticacao_kaggle", "Autenticado via KAGGLE_API_TOKEN (formato novo).")
+    return kaggle.api
+
+def download_kaggle_dataset(
+    dest_dir: str,
+    metadata_csv: str,
+    token_path: str,
+    dataset_slug: str = DATASET_SLUG,
+    forcar_novo_download: bool = False,
+) -> str:
+    """
+    Baixa e extrai o HAM10000, se ainda não estiver presente.
+    Marca "já presente" pela existência do CSV de metadados, não de uma
+    pasta específica — esse dataset extrai direto em dest_dir.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+
+    if os.path.exists(metadata_csv) and not forcar_novo_download:
+        log_etapa(
+            "download_dataset",
+            f"Dataset já presente ({os.path.basename(metadata_csv)} encontrado em "
+            f"'{dest_dir}'), pulando download.",
         )
-        .drop(["loan_status", "int_rate"])
+        return dest_dir
+
+    api = autenticar_kaggle(token_path)
+
+    log_etapa("download_dataset", f"Baixando '{dataset_slug}' do Kaggle...")
+    api.dataset_download_files(dataset_slug, path=dest_dir, quiet=False)
+
+    zips = sorted(
+        (os.path.join(dest_dir, f) for f in os.listdir(dest_dir) if f.endswith(".zip")),
+        key=os.path.getmtime,
     )
+    if not zips:
+        raise FileNotFoundError(
+            f"Download aparentemente concluiu mas nenhum .zip foi encontrado em '{dest_dir}'."
+        )
+    zip_path = zips[-1]
 
-    log_etapa("Dataset de trabalho após seleção de colunas e criação dos targets", f"shape: {df.shape}")
-    return df
+    log_etapa("extracao_dataset", f"Extraindo {os.path.basename(zip_path)}...")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(dest_dir)
 
-def colunas_features_modelo(df: pl.DataFrame) -> list[str]:
-    """Lista todas as colunas de entrada pós-processamento e OHE."""
-    return [c for c in df.columns if c not in _NAO_FEATURES]
+    if not os.path.exists(metadata_csv):
+        arquivos_encontrados = os.listdir(dest_dir)
+        raise FileNotFoundError(
+            f"Extração concluída mas '{os.path.basename(metadata_csv)}' não foi "
+            f"encontrado em '{dest_dir}'. Conteúdo real da pasta: {arquivos_encontrados}. "
+            f"Ajuste metadata_csv se o nome do arquivo vier diferente."
+        )
 
-def colunas_numericas_continuas(df: pl.DataFrame, excluir_extra: set[str] | None = None) -> list[str]:
-    """
-    Lista as colunas numéricas CONTÍNUAS (só Float64) — deliberadamente
-    exclui Int8 (flags binárias: emp_length_missing, dti_missing,
-    *_indisponivel, *_teve_evento) e as dummies do one-hot (UInt8/Int8):
-    correlação de Pearson entre indicadores esparsos infla o coeficiente
-    pela coincidência estrutural de zeros, não pela redundância real de
-    informação, e não faz sentido padronizar (z-score) uma variável 0/1.
-    """
-    excluir = _NAO_FEATURES | _CATEGORICAS | (excluir_extra or set())
-    return [c for c in df.columns if df[c].dtype == pl.Float64 and c not in excluir]
-
-# ---------------------------------------------------------------------------
-# Limpeza e features derivadas
-# ---------------------------------------------------------------------------
-
-def tratar_earliest_cr_line(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Deriva anos_historico_credito a partir de (issue_d - earliest_cr_line).
-    Remove linhas com earliest_cr_line nula. Clipping em [0, 70] anos —
-    piso contra earliest_cr_line posterior a issue_d (erro de digitação
-    nos dados-fonte); teto contra valores fisicamente implausíveis.
-    """
-    n_antes = df.height
-    df = df.filter(pl.col("earliest_cr_line").is_not_null())
     log_nota(
-        f"earliest_cr_line nula: {n_antes - df.height} linhas removidas "
-        f"({(n_antes - df.height) / n_antes * 100:.3f}% da base)"
+        f"Dataset extraído em '{dest_dir}'. Zip mantido em '{zip_path}' "
+        f"(pode apagar depois de confirmar integridade)."
     )
+    return dest_dir
 
-    df = df.with_columns(
-        ((pl.col("issue_d").str.to_date("%b-%Y") - pl.col("earliest_cr_line").str.to_date("%b-%Y"))
-         .dt.total_days() / 365.25)
-        .alias("anos_historico_credito")
-    )
-
-    n_outliers = df.filter(pl.col("anos_historico_credito") > 50).height
-    log_nota(
-        f"{n_outliers} linhas com anos_historico_credito > 50 anos "
-        f"({n_outliers / df.height * 100:.3f}%) — clipping aplicado em [0, 70]."
-    )
-
-    df = df.with_columns(pl.col("anos_historico_credito").clip(lower_bound=0.0, upper_bound=70.0))
-    log_etapa("anos_historico_credito - describe() final", df["anos_historico_credito"].describe())
-
-    return df.drop("earliest_cr_line")
-
-def agrupar_home_ownership(df: pl.DataFrame) -> pl.DataFrame:
-    """Consolida ANY/OTHER/NONE em uma única categoria 'OTHER'."""
-    antes = df["home_ownership"].value_counts()
-    df = df.with_columns(
-        pl.when(pl.col("home_ownership").is_in(["OTHER", "NONE", "ANY"]))
-        .then(pl.lit("OTHER"))
-        .otherwise(pl.col("home_ownership"))
-        .alias("home_ownership")
-    )
-    log_etapa("home_ownership - antes do agrupamento", antes)
-    log_etapa("home_ownership - depois do agrupamento", df["home_ownership"].value_counts())
-    return df
-
-def extrair_term_meses(df: pl.DataFrame) -> pl.DataFrame:
-    """Converte o prazo do empréstimo em string ('36 months'/'60 months') para numérico."""
-    return df.with_columns(
-        pl.col("term").str.extract(r"(\d+)").cast(pl.Int32).alias("term_meses")
-    ).drop("term")
-
-def mapear_emp_length(df: pl.DataFrame) -> pl.DataFrame:
+def sincronizar_para_local(
+    metadata_csv_origem: str,
+    images_dir_1_origem: str,
+    images_dir_2_origem: str,
+    local_dir: str,
+    forcar: bool = False,
+) -> dict:
     """
-    emp_length mapeada para escala ordinal (preserva ordem — diferente de
-    One-Hot, que destruiria a noção de "mais"/"menos" tempo de emprego).
-    Nulos E categorias não reconhecidas viram emp_length_num=0 + flag
-    emp_length_missing=1.
+    Copia metadata.csv + as duas pastas de imagens do Drive para o disco
+    local do runtime (/content). Evita ler milhares de arquivos pequenos
+    direto do Drive via FUSE, que é ordens de magnitude mais lento.
+
+    Efêmero por design: some ao reiniciar o runtime, mas é barato refazer.
+    Retorna os caminhos locais equivalentes, prontos para uso em
+    carregar_inventario.
     """
-    emp_length_map = {
-        "< 1 year": 0, "1 year": 1, "2 years": 2, "3 years": 3, "4 years": 4,
-        "5 years": 5, "6 years": 6, "7 years": 7, "8 years": 8, "9 years": 9,
-        "10+ years": 10,
+    local_metadata_csv = os.path.join(local_dir, os.path.basename(metadata_csv_origem))
+    local_images_dir_1 = os.path.join(local_dir, os.path.basename(images_dir_1_origem))
+    local_images_dir_2 = os.path.join(local_dir, os.path.basename(images_dir_2_origem))
+
+    ja_sincronizado = os.path.exists(local_metadata_csv) and os.path.isdir(local_images_dir_1)
+    if ja_sincronizado and not forcar:
+        log_etapa("sincronizar_para_local", f"Já sincronizado em '{local_dir}', pulando.")
+        return {
+            "metadata_csv": local_metadata_csv,
+            "images_dir_1": local_images_dir_1,
+            "images_dir_2": local_images_dir_2,
+        }
+
+    os.makedirs(local_dir, exist_ok=True)
+    t0 = time.time()
+
+    shutil.copy2(metadata_csv_origem, local_metadata_csv)
+    shutil.copytree(images_dir_1_origem, local_images_dir_1, dirs_exist_ok=True)
+    shutil.copytree(images_dir_2_origem, local_images_dir_2, dirs_exist_ok=True)
+
+    dt = time.time() - t0
+    log_etapa("sincronizar_para_local", f"Copiado para '{local_dir}' em {dt:.0f}s.")
+
+    return {
+        "metadata_csv": local_metadata_csv,
+        "images_dir_1": local_images_dir_1,
+        "images_dir_2": local_images_dir_2,
     }
 
-    n_nulos = df["emp_length"].null_count()
-    log_nota(
-        f"emp_length: {n_nulos} nulos ({n_nulos / df.height * 100:.2f}%) "
-        f"tratados como flag emp_length_missing, não como imputação silenciosa."
+# ---------------------------------------------------------------------------
+# Inventário + split por lesão
+# ---------------------------------------------------------------------------
+
+def _localizar_imagem(image_id: str, pastas_imagens: list[str]) -> str | None:
+    """Procura o arquivo da imagem nas pastas informadas, na ordem dada (ex.: local antes de Drive)."""
+    for pasta in pastas_imagens:
+        candidato = os.path.join(pasta, f"{image_id}.jpg")
+        if os.path.exists(candidato):
+            return candidato
+    return None
+
+def carregar_inventario(metadata_csv: str, pastas_imagens: list[str]) -> pl.DataFrame:
+    """
+    Lê o CSV de metadados e resolve o caminho físico de cada imagem,
+    procurando em todas as pastas informadas (não assume em qual delas
+    cada imagem está — verifica de fato no disco).
+    """
+    df = pl.read_csv(metadata_csv)
+
+    caminhos = [_localizar_imagem(img_id, pastas_imagens) for img_id in df["image_id"].to_list()]
+    df = df.with_columns(pl.Series("caminho", caminhos, dtype=pl.Utf8))
+
+    n_total = df.height
+    n_sem_arquivo = df.filter(pl.col("caminho").is_null()).height
+    n_lesoes_unicas = df["lesion_id"].n_unique()
+
+    log_etapa(
+        "carregar_inventario",
+        f"{n_total} linhas no metadata.csv, {n_lesoes_unicas} lesion_id "
+        f"únicos (múltiplas imagens por lesão são esperadas e documentadas "
+        f"pelo dataset).",
     )
 
-    return df.with_columns(
-        pl.col("emp_length").is_null().cast(pl.Int8).alias("emp_length_missing"),
-        pl.col("emp_length").replace(emp_length_map).cast(pl.Float64, strict=False)
-            .fill_null(0).alias("emp_length_num"),
-    ).drop("emp_length")
+    if n_sem_arquivo > 0:
+        log_nota(
+            f"{n_sem_arquivo} linhas do metadata.csv não têm arquivo de "
+            f"imagem correspondente em nenhuma das pastas informadas — checar "
+            f"antes de seguir (pode ser download/extração incompleta)."
+        )
 
-def tratar_dti(df: pl.DataFrame) -> pl.DataFrame:
+    return df
+
+def montar_split_por_lesao(
+    df: pl.DataFrame,
+    proporcoes: tuple[float, float, float] = (0.7, 0.15, 0.15),
+    seed: int = 42,
+) -> pl.DataFrame:
     """
-    dti: sentinelas (999, -1) e nulos verdadeiros unificados em null, com
-    flag + imputação pela mediana, seguido de clipping no p999 para
-    outliers genuínos de cálculo (renda declarada próxima de zero).
+    Cria a coluna 'split' (train/val/test), garantindo que todas as
+    imagens de um mesmo lesion_id caiam no MESMO split — sem isso, o
+    mesmo tipo de vazamento do dataset de pneumonia se repetiria aqui.
+
+    Estratégia: embaralha a lista de lesion_id únicos (não as linhas!)
+    com seed fixa, e corta essa lista nas proporções pedidas.
+
+    Nota: não estratifica por classe (dx) neste corte simples — vale
+    conferir a distribuição de classes por split depois de rodar isso.
     """
-    skew_inicial = df["dti"].skew()
-    n_sentinelas = df.filter(pl.col("dti").is_in([999, -1])).height
+    train_frac, val_frac, test_frac = proporcoes
+    assert abs(sum(proporcoes) - 1.0) < 1e-9, "Proporções devem somar 1.0"
+
+    lesoes = df["lesion_id"].unique().sort()
+    lesoes_embaralhadas = lesoes.shuffle(seed=seed)
+
+    n = len(lesoes_embaralhadas)
+    n_train = int(n * train_frac)
+    n_val = int(n * val_frac)
+
+    lesoes_train = set(lesoes_embaralhadas[:n_train].to_list())
+    lesoes_val = set(lesoes_embaralhadas[n_train:n_train + n_val].to_list())
+    # o resto (n_train+n_val em diante) vai pra teste
+
+    def _rotular(lesion_id: str) -> str:
+        if lesion_id in lesoes_train:
+            return "train"
+        elif lesion_id in lesoes_val:
+            return "val"
+        return "test"
 
     df = df.with_columns(
-        pl.when(pl.col("dti").is_in([999, -1])).then(None).otherwise(pl.col("dti")).alias("dti")
-    )
-    df = df.with_columns(
-        pl.col("dti").is_null().cast(pl.Int8).alias("dti_missing"),
-        pl.col("dti").fill_null(pl.col("dti").median()).alias("dti"),
+        pl.col("lesion_id").map_elements(_rotular, return_dtype=pl.Utf8).alias("split")
     )
 
-    p999 = df["dti"].quantile(0.999)
-    df = df.with_columns(pl.col("dti").clip(upper_bound=p999))
-    skew_final = df["dti"].skew()
-
-    log_nota(
-        f"dti: skew inicial {skew_inicial:.2f} -> {n_sentinelas} sentinelas (999/-1) "
-        f"removidos -> clipping em p999={p999:.2f} -> skew final {skew_final:.2f}."
+    contagem = df.group_by("split").agg(
+        pl.len().alias("n_imagens"),
+        pl.col("lesion_id").n_unique().alias("n_lesoes"),
     )
-    return df
-
-def tratar_annual_inc(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    annual_inc: cauda superior genuína, tratada com log1p. log1p sozinho
-    não resolve — sobra uma distorção na cauda INFERIOR (rendas declaradas
-    próximas de zero), tratada com clipping no percentil 0,1% já em escala
-    log. Nulos residuais (se houver) ficam para tratar_nulos_residuais,
-    igual a qualquer outra coluna — imputação de nulo não é preocupação
-    desta função, só o formato da distribuição.
-    """
-    skew_antes = df["annual_inc"].skew()
-    df = df.with_columns(pl.col("annual_inc").log1p().alias("annual_inc"))
-    skew_pos_log = df["annual_inc"].skew()
-
-    p_baixo = df["annual_inc"].quantile(0.001)
-    df = df.with_columns(pl.col("annual_inc").clip(lower_bound=p_baixo))
-    skew_final = df["annual_inc"].skew()
-
-    log_nota(
-        f"annual_inc: skew {skew_antes:.2f} -> {skew_pos_log:.2f} (log1p) -> "
-        f"{skew_final:.2f} (clipping inferior em p_baixo={p_baixo:.2f})."
-    )
-    return df
-
-# ---------------------------------------------------------------------------
-# Transformação genérica por regra (skew / zero_pct)
-# ---------------------------------------------------------------------------
-
-_JA_TRATADAS = {
-    "dti", "annual_inc", "fico_range_low", "fico_range_high",
-    "anos_historico_credito", "term_meses", "emp_length_num",
-    "emp_length_missing", "dti_missing",
-}
-
-def aplicar_transformacoes_por_regra(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Regra sistemática para as numéricas restantes (não tratadas
-    individualmente acima):
-        zero_pct > 50% e |skew| >= 1 -> flag binária + log1p, em colunas
-            separadas ({col}_teve_evento, {col}_log) — evento raro: o
-            log1p sozinho comprimiria demais o sinal dos poucos casos
-            "que aconteceram" junto com a massa de zeros.
-        zero_pct <= 50% e |skew| >= 1 -> log1p direto (cauda longa genuína).
-        |skew| < 1 -> sem transformação.
-    """
-    numericas = [
-        c for c in df.columns
-        if df[c].dtype in (pl.Float64, pl.Int64, pl.Int32)
-        and c not in _CATEGORICAS and c not in _NAO_FEATURES and c not in _JA_TRATADAS
-    ]
-
-    skew_vals = df.select([pl.col(c).skew().alias(c) for c in numericas]).row(0, named=True)
-    zero_pcts = df.select([
-        ((pl.col(c) == 0).sum() / pl.len() * 100).alias(c) for c in numericas
-    ]).row(0, named=True)
-
-    cols_flag_log = [c for c in numericas if (zero_pcts[c] or 0) > 50 and abs(skew_vals[c] or 0) >= 1]
-    cols_log_direto = [c for c in numericas if (zero_pcts[c] or 0) <= 50 and abs(skew_vals[c] or 0) >= 1]
-
-    for col in cols_flag_log:
-        df = df.with_columns(
-            (pl.col(col) > 0).cast(pl.Int8).alias(f"{col}_teve_evento"),
-            pl.col(col).log1p().alias(f"{col}_log"),
-        )
-    df = df.drop(cols_flag_log)
-
-    for col in cols_log_direto:
-        df = df.with_columns(pl.col(col).log1p().alias(col))
-
-    log_etapa(f"Transformação por regra - flag+log1p ({len(cols_flag_log)} colunas)", cols_flag_log)
-    log_etapa(f"Transformação por regra - log1p direto ({len(cols_log_direto)} colunas)", cols_log_direto)
+    log_etapa("montar_split_por_lesao", f"Split criado agrupado por lesion_id (seed={seed}):\n{contagem}")
 
     return df
 
-def resolver_redundancia_correlacionada(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Aplica decisões tomadas a partir de checar_correlacao(limiar=0.85):
+def checar_vazamento_split(df: pl.DataFrame) -> dict[str, set]:
+    """Confirma que nenhum lesion_id aparece em mais de um split."""
+    lesoes_por_split = {
+        split: set(df.filter(pl.col("split") == split)["lesion_id"])
+        for split in df["split"].unique().to_list()
+    }
 
-    - fico_range_low/high: r=1.0 (piso e teto do mesmo intervalo).
-      Combinadas em fico_score_medio.
-    - acc_now_delinq_teve_evento/_log e pub_rec_teve_evento/_log:
-      correlação alta reflete principalmente a massa compartilhada de
-      zeros (evento raro), não redundância de informação por si só —
-      versões _log descartadas nesses dois casos.
-    - delinq_amnt_teve_evento/_log e delinq_2yrs_teve_evento/_log: mesma
-      correlação alta, mas com variância real de severidade dentro do
-      subconjunto com evento=1 — ambas as versões mantidas.
+    splits = list(lesoes_por_split.keys())
+    vazamentos = {}
+    for i in range(len(splits)):
+        for j in range(i + 1, len(splits)):
+            a, b = splits[i], splits[j]
+            intersecao = lesoes_por_split[a] & lesoes_por_split[b]
+            if intersecao:
+                vazamentos[f"{a}_vs_{b}"] = intersecao
 
-    Só remove colunas que existirem no df (robusto a rodar sobre um
-    subconjunto de features onde alguma dessas não foi gerada).
-    """
-    if "fico_range_low" in df.columns and "fico_range_high" in df.columns:
-        df = df.with_columns(
-            ((pl.col("fico_range_low") + pl.col("fico_range_high")) / 2).alias("fico_score_medio")
-        ).drop(["fico_range_low", "fico_range_high"])
-
-    a_remover = [c for c in ("acc_now_delinq_log", "pub_rec_log") if c in df.columns]
-    if a_remover:
-        df = df.drop(a_remover)
-
-    log_nota(
-        "Redundância resolvida: fico_range_low/high combinadas em "
-        "fico_score_medio; acc_now_delinq_log e pub_rec_log descartadas "
-        "(flag já captura o sinal); delinq_amnt_log e delinq_2yrs_log "
-        "mantidas (variância real de severidade além da flag)."
-    )
-    return df
-
-def codificar_categoricas(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    One-Hot Encoding das categóricas, sobre o dataset inteiro (antes do
-    split temporal) para garantir que treino/val/teste compartilhem
-    exatamente as mesmas colunas dummy.
-
-    drop_first=True: omite uma categoria por variável, evitando a
-    dependência linear perfeita entre as k colunas de um one-hot completo
-    (elas sempre somam 1) — mesma preocupação de multicolinearidade da
-    etapa de correlação.
-    """
-    categoricas_existentes = [c for c in df.columns if c in _CATEGORICAS]
-    n_antes = df.width
-    df = df.to_dummies(columns=categoricas_existentes, drop_first=True)
-    log_nota(
-        f"One-Hot Encoding: {len(categoricas_existentes)} colunas categóricas -> "
-        f"{df.width - n_antes + len(categoricas_existentes)} colunas dummy (drop_first=True). "
-        f"Total de colunas: {n_antes} -> {df.width}."
-    )
-    return df
-
-def split_temporal(df: pl.DataFrame, frac_treino: float = 0.70, frac_val: float = 0.15) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """
-    Corta cronologicamente em treino (mais antigo) / validação / teste
-    (mais recente), nas proporções frac_treino/frac_val/resto.
-
-    Corte por VALOR de data (issue_d parseada), não por posição de linha
-    após o sort — issue_d tem granularidade mensal, e cortar por posição
-    fragmentaria um mesmo mês entre duas partições. As frações resultantes
-    são aproximadas, não exatas.
-
-    issue_d continua como string "%b-%Y" no restante do pipeline — ordenar
-    pela coluna crua seria alfabético por nome de mês (ex.: "Aug-2018"
-    antes de "Dec-2007"), não cronológico. Por isso parseamos aqui, só
-    para decidir os cortes, e não alteramos a coluna original.
-    """
-    if frac_treino + frac_val >= 1.0:
-        raise ValueError("frac_treino + frac_val deve ser menor que 1.0")
-
-    df = df.with_columns(pl.col("issue_d").str.to_date("%b-%Y").alias("_data_split"))
-    df_ordenado = df.sort("_data_split")
-
-    n_corte_treino = int(df.height * frac_treino)
-    n_corte_val = int(df.height * (frac_treino + frac_val))
-
-    data_corte_treino = df_ordenado["_data_split"][n_corte_treino]
-    data_corte_val = df_ordenado["_data_split"][n_corte_val]
-
-    df_treino = df.filter(pl.col("_data_split") < data_corte_treino).drop("_data_split")
-    df_val = df.filter(
-        (pl.col("_data_split") >= data_corte_treino) & (pl.col("_data_split") < data_corte_val)
-    ).drop("_data_split")
-    df_teste = df.filter(pl.col("_data_split") >= data_corte_val).drop("_data_split")
-
-    total = df.height
-    log_nota(
-        f"Split temporal: cortes em {data_corte_treino} e {data_corte_val} (issue_d).\n"
-        f"Treino: {df_treino.height} linhas ({df_treino.height / total:.1%}).\n"
-        f"Validação: {df_val.height} linhas ({df_val.height / total:.1%}).\n"
-        f"Teste: {df_teste.height} linhas ({df_teste.height / total:.1%})."
-    )
-
-    for nome, parte in [("treino", df_treino), ("validação", df_val), ("teste", df_teste)]:
-        dist = (
-            parte["target_classificacao"].value_counts()
-            .with_columns((pl.col("count") / pl.col("count").sum() * 100).round(2).alias("%"))
-        )
-        log_etapa(f"target_classificacao - distribuição no {nome}", dist)
-    log_nota(
-        "Diferenças na distribuição do target entre as três partições são "
-        "esperadas em split temporal (refletem mudança de política de "
-        "crédito/comportamento macroeconômico entre safras), não erro de amostragem."
-    )
-
-    return df_treino, df_val, df_teste
-
-def tratar_nulos_residuais(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_teste: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """
-    Trata nulos residuais que sobreviveram a todas as etapas anteriores —
-    tipicamente colunas de bureau de crédito "avançado" que o Lending Club
-    só passou a coletar a partir de certa safra (ausência estrutural, não
-    aleatória), mais alguns nulos esparsos genuínos.
-
-    Para cada coluna com nulo (em qualquer split), cria uma flag
-    {coluna}_indisponivel (preserva a informação de que o dado não
-    existia na origem) e imputa: MEDIANA para colunas contínuas, MODA
-    para flags Int8 (fill_null com mediana promoveria uma coluna 0/1 para
-    float, quebrando o dtype). Estatísticas calculadas exclusivamente no
-    treino, aplicadas sem recálculo a validação/teste.
-    """
-    colunas_com_nulo = [
-        c for c in df_treino.columns
-        if c not in _NAO_FEATURES and (
-            df_treino[c].null_count() > 0 or df_val[c].null_count() > 0 or df_teste[c].null_count() > 0
-        )
-    ]
-
-    if not colunas_com_nulo:
-        log_nota("Nenhum nulo residual encontrado - nada a tratar.")
-        return df_treino, df_val, df_teste
-
-    colunas_flag = [c for c in colunas_com_nulo if df_treino[c].dtype == pl.Int8]
-    colunas_continuas = [c for c in colunas_com_nulo if c not in colunas_flag]
-
-    medianas = {}
-    if colunas_continuas:
-        medianas = df_treino.select([pl.col(c).median().alias(c) for c in colunas_continuas]).row(0, named=True)
-
-    modas = {}
-    for c in colunas_flag:
-        valores_moda = df_treino[c].drop_nulls().mode().sort()
-        modas[c] = int(valores_moda[0]) if len(valores_moda) > 0 else 0
-
-    if colunas_flag:
+    if vazamentos:
+        detalhes = ", ".join(f"{k}: {len(v)} lesões" for k, v in vazamentos.items())
         log_nota(
-            f"{len(colunas_flag)} coluna(s) Int8 (flags) com nulo residual tratadas "
-            f"pela MODA (preservando dtype), não pela mediana: {colunas_flag}"
+            f"VAZAMENTO DETECTADO no split construído — {detalhes}. "
+            f"Isso não deveria acontecer com montar_split_por_lesao; revisar antes de treinar."
+        )
+    else:
+        log_etapa(
+            "checagem_vazamento_split",
+            "Nenhum vazamento de lesion_id entre splits — split construído corretamente.",
         )
 
-    def _aplicar(df: pl.DataFrame) -> pl.DataFrame:
-        df = df.with_columns([
-            pl.col(c).is_null().cast(pl.Int8).alias(f"{c}_indisponivel") for c in colunas_com_nulo
-        ])
-        if colunas_continuas:
-            df = df.with_columns([pl.col(c).fill_null(medianas[c]).alias(c) for c in colunas_continuas])
-        if colunas_flag:
-            df = df.with_columns([pl.col(c).fill_null(modas[c]).cast(pl.Int8).alias(c) for c in colunas_flag])
-        return df
+    return vazamentos
 
-    n_antes = len(colunas_features_modelo(df_treino))
-    df_treino = _aplicar(df_treino)
-    df_val = _aplicar(df_val)
-    df_teste = _aplicar(df_teste)
-    n_depois = len(colunas_features_modelo(df_treino))
+def salvar_inventario_particionado(df: pl.DataFrame, path: str) -> None:
+    """Persiste o inventário com a coluna 'split' já definida."""
+    diretorio = os.path.dirname(path)
+    if diretorio:
+        os.makedirs(diretorio, exist_ok=True)
+    df.write_parquet(path)
+    log_etapa("salvar_inventario", f"Inventário particionado salvo em '{path}' ({df.height} linhas).")
 
-    log_etapa(f"Nulos residuais tratados ({len(colunas_com_nulo)} colunas)", colunas_com_nulo)
-    log_nota(f"input_size: {n_antes} -> {n_depois} (+{n_depois - n_antes} flags de indisponibilidade).")
-
-    return df_treino, df_val, df_teste
-
-def padronizar_numericas(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_teste: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, dict]:
-    """
-    Padronização Z-score, com média/desvio calculados exclusivamente no
-    treino e aplicados às três partições sem recálculo — calcular com o
-    dataframe inteiro vazaria estatísticas de períodos futuros.
-
-    Colunas com desvio padrão zero no treino (constantes) são deixadas
-    SEM transformação (em vez de aplicar com um desvio de 1.0 arbitrário)
-    e reportadas explicitamente.
-    """
-    colunas = colunas_numericas_continuas(df_treino)
-
-    medias = df_treino.select([pl.col(c).mean().alias(c) for c in colunas]).row(0, named=True)
-    desvios = df_treino.select([pl.col(c).std().alias(c) for c in colunas]).row(0, named=True)
-
-    colunas_constantes = [c for c in colunas if not desvios[c]]
-    colunas_a_padronizar = [c for c in colunas if desvios[c]]
-
-    if colunas_constantes:
-        log_nota(
-            f"{len(colunas_constantes)} coluna(s) com desvio padrão zero no treino "
-            f"NÃO foram padronizadas, para evitar divisão por zero: {colunas_constantes}"
+def carregar_inventario_particionado(path: str) -> pl.DataFrame:
+    """Carrega o inventário particionado salvo, sem precisar refazer o split."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"'{path}' não existe ainda — rode salvar_inventario_particionado() "
+            f"primeiro (ou o pipeline completo: carregar_inventario -> "
+            f"montar_split_por_lesao -> salvar_inventario_particionado)."
         )
-
-    def _aplicar(df: pl.DataFrame) -> pl.DataFrame:
-        return df.with_columns([
-            ((pl.col(c) - medias[c]) / desvios[c]).alias(c) for c in colunas_a_padronizar
-        ])
-
-    df_treino = _aplicar(df_treino)
-    df_val = _aplicar(df_val)
-    df_teste = _aplicar(df_teste)
-
-    stats = {"medias": medias, "desvios": desvios, "colunas": colunas_a_padronizar}
-
-    log_etapa("Validação - média por coluna no TREINO (esperado: ~0)", df_treino.select(colunas_a_padronizar).mean())
-    log_etapa("Validação - média por coluna na VALIDAÇÃO (esperado: != 0, prova de ausência de vazamento)", df_val.select(colunas_a_padronizar).mean())
-    log_etapa("Validação - média por coluna no TESTE (esperado: != 0, prova de ausência de vazamento)", df_teste.select(colunas_a_padronizar).mean())
-    log_nota(f"Padronização (Z-score) aplicada a {len(colunas_a_padronizar)} colunas contínuas, estatística do treino ({df_treino.height} linhas).")
-
-    return df_treino, df_val, df_teste, stats
-
-# ---------------------------------------------------------------------------
-# Cache em parquet (resiliência a reinício de runtime)
-# ---------------------------------------------------------------------------
-
-def salvar_particoes(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_teste: pl.DataFrame, diretorio: str) -> None:
-    """
-    Salva as três partições já pré-processadas (split + nulos residuais +
-    padronização) em parquet — permite recarregar em segundos após um
-    crash/reinício do runtime, sem reprocessar o CSV bruto do zero.
-    """
-    os.makedirs(diretorio, exist_ok=True)
-    df_treino.write_parquet(os.path.join(diretorio, "treino.parquet"))
-    df_val.write_parquet(os.path.join(diretorio, "validacao.parquet"))
-    df_teste.write_parquet(os.path.join(diretorio, "teste.parquet"))
-    log_nota(f"Partições salvas em '{diretorio}' (treino/validacao/teste.parquet).")
-
-def carregar_particoes(diretorio: str) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """Recarrega as partições salvas por salvar_particoes(), evitando reprocessar o pipeline inteiro."""
-    caminho_treino = os.path.join(diretorio, "treino.parquet")
-    if not os.path.exists(caminho_treino):
-        raise FileNotFoundError(f"'{caminho_treino}' não existe ainda — rode salvar_particoes() primeiro.")
-    df_treino = pl.read_parquet(caminho_treino)
-    df_val = pl.read_parquet(os.path.join(diretorio, "validacao.parquet"))
-    df_teste = pl.read_parquet(os.path.join(diretorio, "teste.parquet"))
-    log_nota(f"Partições recarregadas de '{diretorio}' - treino: {df_treino.shape}, validação: {df_val.shape}, teste: {df_teste.shape}.")
-    return df_treino, df_val, df_teste
+    df = pl.read_parquet(path)
+    log_etapa("carregar_inventario_particionado", f"{df.height} linhas carregadas de '{path}'.")
+    return df
 
 # ---------------------------------------------------------------------------
 # Ponte para o PyTorch
 # ---------------------------------------------------------------------------
 
-def extrair_arrays(df: pl.DataFrame, colunas_features: list[str]):
-    """Converte o DataFrame Polars para arrays NumPy em float32 para o PyTorch."""
-    X = df.select(colunas_features).to_numpy().astype("float32")
-    y_clf = df["target_classificacao"].to_numpy().astype("float32")
-    y_reg = df["target_regressao"].to_numpy().astype("float32")
-    return X, y_clf, y_reg
+class HAM10000Dataset(Dataset):
+    """Dataset PyTorch sobre o inventário Polars (uma linha = uma imagem)."""
 
-def validar_tensores(tensores: dict[str, torch.Tensor], input_size_esperado: int) -> None:
-    """Verifica integridade de dimensões, NaNs e valores infinitos antes de qualquer treino."""
-    for nome, tensor in tensores.items():
-        assert tensor.shape[1] == input_size_esperado, (
-            f"{nome} tem {tensor.shape[1]} colunas, esperado {input_size_esperado}. "
-            f"Confira se o pipeline de pré-processamento mudou desde a última contagem."
+    def __init__(self, df: pl.DataFrame, transform: transforms.Compose):
+        classes_presentes = set(df["dx"].unique().to_list())
+        classes_desconhecidas = classes_presentes - set(CLASSES)
+        if classes_desconhecidas:
+            raise ValueError(
+                f"Classes não mapeadas em CLASSES: {classes_desconhecidas}. "
+                f"Atualize a constante CLASSES em data.py."
+            )
+
+        self.caminhos = df["caminho"].to_list()
+        self.rotulos = [CLASSE_PARA_INDICE[c] for c in df["dx"].to_list()]
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.caminhos)
+
+    def __getitem__(self, idx: int):
+        img = Image.open(self.caminhos[idx]).convert("RGB")
+        img = self.transform(img)
+        rotulo = torch.tensor(self.rotulos[idx], dtype=torch.long)
+        return img, rotulo
+
+def montar_transform(media_rgb: tuple, desvio_rgb: tuple, tamanho: int = TAMANHO_RESIZE, aumentar_dados: bool = False) -> transforms.Compose:
+    """
+    Resize direto pro quadrado (distorce a proporção — decisão de
+    simplicidade, documentar no relatório) + normalização com as
+    estatísticas reais do dataset (calculadas na EDA, não os valores
+    padrão do ImageNet).
+
+    aumentar_dados=True acrescenta augmentation geométrico (flip
+    horizontal/vertical, rotação até 45°, translação/escala leves) —
+    lesões de pele não têm orientação canônica, então essas
+    transformações preservam o rótulo. Só faz sentido no split de
+    TREINO (ver preparar_dataloaders); aplicar em val/test faria a
+    métrica de avaliação variar entre execuções à toa.
+    """
+    passos = [transforms.Resize((tamanho, tamanho))]
+    if aumentar_dados:
+        passos += [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation(degrees=45),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+        ]
+    passos += [
+        transforms.ToTensor(),
+        transforms.Normalize(mean=media_rgb, std=desvio_rgb),
+    ]
+    return transforms.Compose(passos)
+
+def preparar_dataloaders(
+    df: pl.DataFrame,
+    media_rgb: tuple,
+    desvio_rgb: tuple,
+    batch_size: int = 32,
+    tamanho: int = TAMANHO_RESIZE,
+    num_workers: int = 2,
+    aumentar_treino: bool = True,
+) -> dict:
+    """
+    Recebe o inventário completo (com coluna 'split') e devolve um dict
+    {'train': DataLoader, 'val': DataLoader, 'test': DataLoader}.
+
+    shuffle=True só no train — val/test mantêm ordem fixa, para
+    diagnóstico e comparação entre execuções não ficarem embaralhados à toa.
+
+    aumentar_treino=True (padrão): o split de treino usa um transform com
+    augmentation geométrico (ver montar_transform); val/test usam sempre
+    o transform sem augmentation — todo modelo treinado a partir do
+    'train' destes DataLoaders (CNN de referência, variante residual,
+    LSTM sobre patches) se beneficia igualmente, então uma comparação
+    entre arquiteturas continua isolando só a arquitetura.
+    """
+    transform_treino = montar_transform(media_rgb, desvio_rgb, tamanho, aumentar_dados=aumentar_treino)
+    transform_avaliacao = montar_transform(media_rgb, desvio_rgb, tamanho, aumentar_dados=False)
+
+    dataloaders = {}
+    for split in ["train", "val", "test"]:
+        df_split = df.filter(pl.col("split") == split)
+        transform = transform_treino if split == "train" else transform_avaliacao
+        dataset = HAM10000Dataset(df_split, transform)
+        dataloaders[split] = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=(split == "train"),
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
         )
-        assert not torch.isnan(tensor).any(), f"{nome} contém NaN."
-        assert not torch.isinf(tensor).any(), f"{nome} contém Inf."
+
     log_etapa(
-        "Validação dos tensores de entrada (shape / NaN / Inf)",
-        {nome: f"shape={tuple(t.shape)}, OK" for nome, t in tensores.items()},
+        "preparar_dataloaders",
+        f"DataLoaders prontos — batch_size={batch_size}, tamanho={tamanho}x{tamanho}, "
+        f"augmentation no treino={'ativo' if aumentar_treino else 'inativo'}. "
+        f"Tamanhos: " + ", ".join(f"{k}={len(v.dataset)}" for k, v in dataloaders.items()),
     )
 
-def preparar_dataloaders(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_test: pl.DataFrame, batch_size: int = 512) -> dict:
+    return dataloaders
+
+# ---------------------------------------------------------------------------
+# Features artesanais do baseline (cor + textura)
+# ---------------------------------------------------------------------------
+
+def extrair_features(caminho_imagem: str) -> np.ndarray:
     """
-    Instancia e expõe os DataLoader de treino, validação e teste.
-
-    y é convertido com unsqueeze(1) — shape (N, 1), compatível com a saída
-    de 1 neurônio do MLP. Sem isso, BCEWithLogitsLoss/MSELoss fariam
-    broadcasting silencioso entre (N,) e (N, 1) e produziriam uma loss
-    matematicamente errada sem erro algum (e dependeriam de um .squeeze()
-    do lado do modelo para "consertar" de volta, frágil com batch de
-    tamanho 1). X é o MESMO tensor para os dois problemas — só o y muda.
-
-    drop_last=True nos loaders de treino: os MLPs usam BatchNorm1d, que
-    não aceita um batch de tamanho 1 durante o treino (o último batch de
-    uma época pode ter exatamente 1 amostra se o tamanho do treino não
-    for múltiplo de batch_size).
+    Vetor de features = histograma de cor (R, G, B, 16 bins cada,
+    normalizado) + histograma de textura LBP (10 bins, normalizado).
+    Total: 48 + 10 = 58 features.
     """
-    features = colunas_features_modelo(df_treino)
-    input_size = len(features)
-
-    n_val = len(colunas_features_modelo(df_val))
-    n_test = len(colunas_features_modelo(df_test))
-    assert input_size == n_val == n_test, (
-        f"Número de features difere entre partições: treino={input_size}, "
-        f"val={n_val}, teste={n_test}. Confirme que codificar_categoricas "
-        f"rodou antes de split_temporal."
+    img = Image.open(caminho_imagem).convert("RGB").resize(
+        (TAMANHO_PADRONIZADO_BASELINE, TAMANHO_PADRONIZADO_BASELINE)
     )
+    arr = np.asarray(img)
 
-    X_train, y_train_clf, y_train_reg = extrair_arrays(df_treino, features)
-    X_val, y_val_clf, y_val_reg = extrair_arrays(df_val, features)
-    X_test, y_test_clf, y_test_reg = extrair_arrays(df_test, features)
+    features_cor = []
+    for canal in range(3):
+        hist, _ = np.histogram(arr[:, :, canal], bins=BINS_HISTOGRAMA_COR, range=(0, 256))
+        hist = hist.astype(np.float64)
+        hist /= hist.sum() + 1e-8
+        features_cor.append(hist)
+    features_cor = np.concatenate(features_cor)
 
-    validar_tensores({
-        "X_train": torch.from_numpy(X_train),
-        "X_val": torch.from_numpy(X_val),
-        "X_test": torch.from_numpy(X_test),
-    }, input_size)
+    cinza = np.asarray(img.convert("L"))
+    lbp = local_binary_pattern(cinza, P=PONTOS_LBP, R=RAIO_LBP, method="uniform")
+    n_bins_lbp = PONTOS_LBP + 2
+    hist_lbp, _ = np.histogram(lbp, bins=n_bins_lbp, range=(0, n_bins_lbp))
+    hist_lbp = hist_lbp.astype(np.float64)
+    hist_lbp /= hist_lbp.sum() + 1e-8
 
-    X_train_t, X_val_t, X_test_t = torch.from_numpy(X_train), torch.from_numpy(X_val), torch.from_numpy(X_test)
+    return np.concatenate([features_cor, hist_lbp])
 
-    def _y(arr):
-        return torch.from_numpy(arr).unsqueeze(1)
+def construir_matriz_features(df: pl.DataFrame) -> tuple:
+    """Extrai features de todas as linhas do df. Retorna (X, y)."""
+    caminhos = df["caminho"].to_list()
+    rotulos_str = df["dx"].to_list()
 
-    ds_train_clf = TensorDataset(X_train_t, _y(y_train_clf))
-    ds_train_reg = TensorDataset(X_train_t, _y(y_train_reg))
-    ds_val_clf = TensorDataset(X_val_t, _y(y_val_clf))
-    ds_val_reg = TensorDataset(X_val_t, _y(y_val_reg))
-    ds_test_clf = TensorDataset(X_test_t, _y(y_test_clf))
-    ds_test_reg = TensorDataset(X_test_t, _y(y_test_reg))
+    X = np.stack([extrair_features(c) for c in caminhos])
+    y = np.array([CLASSE_PARA_INDICE[r] for r in rotulos_str])
 
-    return {
-        "input_size": input_size,
-        "classificacao": {
-            "train": DataLoader(ds_train_clf, batch_size=batch_size, shuffle=True, drop_last=True),
-            "val": DataLoader(ds_val_clf, batch_size=batch_size, shuffle=False),
-            "test": DataLoader(ds_test_clf, batch_size=batch_size, shuffle=False),
-        },
-        "regressao": {
-            "train": DataLoader(ds_train_reg, batch_size=batch_size, shuffle=True, drop_last=True),
-            "val": DataLoader(ds_val_reg, batch_size=batch_size, shuffle=False),
-            "test": DataLoader(ds_test_reg, batch_size=batch_size, shuffle=False),
-        },
-    }
+    log_etapa("construir_matriz_features", f"Features extraídas: X.shape={X.shape}, {len(np.unique(y))} classes.")
 
-def construir_ambiente_reduzido(df_treino: pl.DataFrame, df_val: pl.DataFrame, df_teste: pl.DataFrame, colunas_selecionadas: list[str], tipo_problema: str, batch_size: int = 512) -> dict:
-    """
-    Monta um dict "dados" no MESMO formato de preparar_dataloaders, mas
-    restrito a colunas_selecionadas e a um único tipo_problema — pronto
-    para passar direto a treinar_variacao/avaliar_modelo_final sem
-    modificar nenhuma dessas funções.
-
-    Usado depois de calcular_permutation_importance + selecionar_top_features
-    (ver utils.py), para medir se um subconjunto de features (ex.: top 30
-    de ~200) sustenta o desempenho do modelo completo — reaproveitando a
-    MESMA arquitetura e loop de treino, isolando o efeito da redução de
-    features de qualquer outra variável.
-
-    Só constrói os loaders do tipo_problema pedido (não classificação e
-    regressão juntas, como preparar_dataloaders) — a seleção de features
-    tipicamente parte da importância medida para um problema específico.
-    """
-    if tipo_problema not in ("classificacao", "regressao"):
-        raise ValueError(f"tipo_problema deve ser 'classificacao' ou 'regressao', recebido: {tipo_problema}")
-
-    input_size = len(colunas_selecionadas)
-
-    X_train, y_train_clf, y_train_reg = extrair_arrays(df_treino, colunas_selecionadas)
-    X_val, y_val_clf, y_val_reg = extrair_arrays(df_val, colunas_selecionadas)
-    X_test, y_test_clf, y_test_reg = extrair_arrays(df_teste, colunas_selecionadas)
-
-    validar_tensores({
-        "X_train": torch.from_numpy(X_train),
-        "X_val": torch.from_numpy(X_val),
-        "X_test": torch.from_numpy(X_test),
-    }, input_size)
-
-    X_train_t, X_val_t, X_test_t = torch.from_numpy(X_train), torch.from_numpy(X_val), torch.from_numpy(X_test)
-
-    def _y(arr):
-        return torch.from_numpy(arr).unsqueeze(1)
-
-    if tipo_problema == "classificacao":
-        y_train_t, y_val_t, y_test_t = _y(y_train_clf), _y(y_val_clf), _y(y_test_clf)
-    else:
-        y_train_t, y_val_t, y_test_t = _y(y_train_reg), _y(y_val_reg), _y(y_test_reg)
-
-    ds_train = TensorDataset(X_train_t, y_train_t)
-    ds_val = TensorDataset(X_val_t, y_val_t)
-    ds_test = TensorDataset(X_test_t, y_test_t)
-
-    log_nota(f"Ambiente reduzido pronto: {input_size} features selecionadas (tipo_problema={tipo_problema}).")
-
-    return {
-        "input_size": input_size,
-        tipo_problema: {
-            "train": DataLoader(ds_train, batch_size=batch_size, shuffle=True, drop_last=True),
-            "val": DataLoader(ds_val, batch_size=batch_size, shuffle=False),
-            "test": DataLoader(ds_test, batch_size=batch_size, shuffle=False),
-        },
-    }
+    return X, y
