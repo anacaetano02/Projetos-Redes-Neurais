@@ -23,21 +23,16 @@ _experimentos = []
 
 class FocalLoss(nn.Module):
     """
-    Focal Loss (Lin et al., 2017 — "Focal Loss for Dense Object
-    Detection"): FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t).
-
-    Diferença em relação à CrossEntropyLoss ponderada: em vez de só
-    pesar por frequência de classe (alpha, aqui = pesos_classe), o termo
-    (1 - p_t)^gamma reduz a contribuição de exemplos JÁ bem classificados
-    (p_t alto) e concentra o gradiente nos exemplos difíceis/mal
-    classificados — independente de classe. Ataca diretamente o padrão
-    observado no projeto (classes raras como df/vasc falhando de forma
-    parecida em todos os modelos testados), sem aumentar parâmetros do
-    modelo.
-
-    gamma=2.0 é o valor padrão usado no artigo original; gamma=0
-    recupera exatamente a CrossEntropyLoss ponderada (bom teste de
-    sanidade se quiser confirmar a implementação).
+    Focal Loss (Lin et al., 2017). Mesma ideia de ponderação por classe de
+    computar_pesos_classe (usada aqui como alpha), somada a um fator
+    (1 - p_t)^gamma que reduz a contribuição de exemplos já bem
+    classificados (p_t alto) e concentra o gradiente nos exemplos
+    difíceis. CrossEntropyLoss ponderada corrige a MAGNITUDE do erro por
+    classe, mas dá o mesmo peso relativo a exemplos fáceis e difíceis
+    dentro da mesma classe — Focal Loss ataca especificamente o padrão de
+    falha esperado num dataset dominado por uma classe majoritária (nv,
+    ~67% do HAM10000): exemplos fáceis da classe majoritária param de
+    dominar o gradiente assim que o modelo já acerta a maioria deles.
     """
 
     def __init__(self, alpha: torch.Tensor = None, gamma: float = 2.0, reduction: str = "mean"):
@@ -46,16 +41,31 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
         self.reduction = reduction
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction="none")
-        pt = torch.exp(-ce_loss)  # p_t = probabilidade que o modelo deu para a classe correta
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        log_probs = F.log_softmax(logits, dim=1)
+        log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt = log_pt.exp()
+
+        perda = -(1 - pt).pow(self.gamma) * log_pt
+
+        if self.alpha is not None:
+            alpha_t = self.alpha.to(logits.device)[targets]
+            perda = alpha_t * perda
+            # reduction="mean" com alpha normaliza por sum(alpha_t), não por
+            # N — mesma convenção de nn.CrossEntropyLoss(weight=...), para
+            # a escala da loss ficar comparável entre as duas (troca de
+            # critério não deveria, por si só, exigir recalibrar lr).
+            if self.reduction == "mean":
+                return perda.sum() / alpha_t.sum()
+            elif self.reduction == "sum":
+                return perda.sum()
+            return perda
 
         if self.reduction == "mean":
-            return focal_loss.mean()
+            return perda.mean()
         elif self.reduction == "sum":
-            return focal_loss.sum()
-        return focal_loss
+            return perda.sum()
+        return perda
 
 def fixar_seeds(seed: int = 42, priorizar_velocidade: bool = True) -> None:
     """
@@ -127,24 +137,23 @@ def treinar_modelo(
     device: str = None,
     forcar_do_zero: bool = False,
     clip_grad_norm_max: float = 5.0,
-    usar_focal_loss: bool = False,
-    focal_gamma: float = 2.0,
+    criterio: nn.Module = None,
 ) -> dict:
     """
     Treina 'modelo' com early stopping por val_loss. Salva o melhor
     checkpoint (menor val_loss) em checkpoint_dir e loga métricas por
     época no TensorBoard (dir_runs/nome_experimento).
 
-    usar_focal_loss=False (padrão): CrossEntropyLoss ponderada por
-    pesos_classe, como em todos os experimentos anteriores. True: usa
-    FocalLoss (ver classe acima) com o mesmo pesos_classe como alpha —
-    combina os dois mecanismos (peso por frequência + foco em exemplo
-    difícil) em vez de escolher um ou outro.
-
     Retoma automaticamente: se existir um estado salvo de uma sessão
     anterior deste mesmo experimento, carrega e continua de onde parou
     em vez de treinar do zero — protege contra desconexão do Colab no
     meio do treino. forcar_do_zero=True ignora esse estado.
+
+    criterio: função de perda já construída (ex.: FocalLoss(alpha=...)).
+    Se None (padrão), usa CrossEntropyLoss(weight=pesos_classe) — o
+    comportamento de sempre. pesos_classe continua sendo parâmetro
+    obrigatório mesmo quando criterio é passado, para manter a assinatura
+    estável entre chamadas.
 
     Retorna um dict com o histórico (train_loss, val_loss, grad_norm,
     batches_overflow por época) — pronto para plot_curvas_loss/
@@ -154,10 +163,7 @@ def treinar_modelo(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     modelo = modelo.to(device)
 
-    if usar_focal_loss:
-        criterio = FocalLoss(alpha=pesos_classe.to(device), gamma=focal_gamma)
-    else:
-        criterio = nn.CrossEntropyLoss(weight=pesos_classe.to(device))
+    criterio = criterio if criterio is not None else nn.CrossEntropyLoss(weight=pesos_classe.to(device))
     otimizador = torch.optim.AdamW(modelo.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(otimizador, mode="min", patience=3, factor=0.5)
 
@@ -193,7 +199,6 @@ def treinar_modelo(
     log_etapa(
         "treinar_modelo",
         f"Treino de '{nome_experimento}' em {device} (AMP {'ativo' if usa_amp else 'inativo'}), "
-        f"loss={'Focal (gamma=' + str(focal_gamma) + ')' if usar_focal_loss else 'CrossEntropy ponderada'}, "
         f"até {epochs} épocas (retomando da época {epoca_inicial}).",
     )
 
